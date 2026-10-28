@@ -1,0 +1,34 @@
+{
+  "name": "pi-interactive-subagents",
+  "version": "1.0.0",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "author": "Mayank Ladva",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mayank-ladva/pi-interactive-subagents"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/test.ts",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/subagents/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@earendil-works/pi-tui": "^1.4.0",
+    "@sinclair/typebox": "^0.34.49"
+  }
+}
