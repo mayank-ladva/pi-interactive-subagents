@@ -9,7 +9,7 @@
   "author": "Mayank Ladva",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mayank-ladva/pi-interactive-subagents"
+    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
   },
   "type": "module",
   "scripts": {
