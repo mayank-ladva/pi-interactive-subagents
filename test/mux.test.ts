@@ -4,8 +4,18 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  closeSurface, createSurface, createSurfaceSplit, getMuxBackend, isMuxAvailable,
-  muxSetupHint, pollForExit, readScreen, readScreenAsync, sendCommand, sendLongCommand, sendMessage,
+  closeSurface,
+  createSurface,
+  createSurfaceSplit,
+  getMuxBackend,
+  isMuxAvailable,
+  muxSetupHint,
+  pollForExit,
+  readScreen,
+  readScreenAsync,
+  sendCommand,
+  sendLongCommand,
+  sendMessage,
 } from "../pi-extension/subagents/tmux.ts";
 
 const envKeys = ["PATH", "TMUX", "TMUX_PANE", "HERDR_ENV", "HERDR_PANE_ID", "PI_MUX_TEST_DIR"];
@@ -18,7 +28,11 @@ function state(panes: object[], extra: object = {}) {
   writeFileSync(join(dir, "state.json"), JSON.stringify({ panes, ...extra }));
 }
 function calls(): string[][] {
-  return readFileSync(join(dir, "calls.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  return readFileSync(join(dir, "calls.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 before(() => {
@@ -98,7 +112,11 @@ describe("multiplexer backend selection", () => {
     assert.equal(await readScreenAsync("%2"), "tmux screen");
     assert.deepEqual(calls()[0], ["send-keys", "-t", "%2", "-l", "echo hello"]);
     assert.deepEqual(calls()[1], ["send-keys", "-t", "%2", "Enter"]);
-    assert.ok(calls().slice(2).every((args) => args[0] === "capture-pane"));
+    assert.ok(
+      calls()
+        .slice(2)
+        .every((args) => args[0] === "capture-pane"),
+    );
     sendMessage("%2", "keep working");
     assert.deepEqual(calls().at(-2), ["send-keys", "-t", "%2", "-l", "keep working"]);
   });
@@ -111,23 +129,43 @@ describe("Herdr pane operations", () => {
     assert.notEqual(first, second);
     const splits = calls().filter((args) => args[1] === "split");
     assert.deepEqual(splits[0], [
-      "pane", "split", "--pane", parent.pane_id, "--direction", "down",
-      "--cwd", process.cwd(), "--no-focus",
+      "pane",
+      "split",
+      "--pane",
+      parent.pane_id,
+      "--direction",
+      "down",
+      "--cwd",
+      process.cwd(),
+      "--no-focus",
     ]);
     assert.deepEqual(splits[1], [
-      "pane", "split", "--pane", first, "--direction", "right",
-      "--cwd", process.cwd(), "--no-focus",
+      "pane",
+      "split",
+      "--pane",
+      first,
+      "--direction",
+      "right",
+      "--cwd",
+      process.cwd(),
+      "--no-focus",
     ]);
     closeSurface(first);
     closeSurface(second);
-    assert.deepEqual(calls().slice(-2), [["pane", "close", first], ["pane", "close", second]]);
+    assert.deepEqual(calls().slice(-2), [
+      ["pane", "close", first],
+      ["pane", "close", second],
+    ]);
   });
 
   it("does not target a child that was manually closed", () => {
     const first = createSurface("scout");
     state([parent, userPane], { counter: 1 });
     const second = createSurface("worker");
-    const split = calls().filter((args) => args[1] === "split").at(-1)!;
+    const split = calls()
+      .filter((args) => args[1] === "split")
+      .at(-1);
+    assert.ok(split);
     assert.equal(split[split.indexOf("--pane") + 1], parent.pane_id);
     closeSurface(first);
     closeSurface(second);
@@ -137,7 +175,10 @@ describe("Herdr pane operations", () => {
     const first = createSurface("scout");
     state([parent, userPane, { pane_id: first, rect: { width: 30, height: 40 } }], { counter: 1 });
     const second = createSurface("worker");
-    const split = calls().filter((args) => args[1] === "split").at(-1)!;
+    const split = calls()
+      .filter((args) => args[1] === "split")
+      .at(-1);
+    assert.ok(split);
     assert.equal(split[split.indexOf("--direction") + 1], "down");
     closeSurface(first);
     closeSurface(second);
@@ -146,13 +187,20 @@ describe("Herdr pane operations", () => {
   it("splits the largest owned child instead of repeatedly shrinking the latest one", () => {
     const first = createSurface("scout");
     const second = createSurface("worker");
-    state([
-      parent, userPane,
-      { pane_id: first, rect: { width: 180, height: 25 } },
-      { pane_id: second, rect: { width: 40, height: 25 } },
-    ], { counter: 2 });
+    state(
+      [
+        parent,
+        userPane,
+        { pane_id: first, rect: { width: 180, height: 25 } },
+        { pane_id: second, rect: { width: 40, height: 25 } },
+      ],
+      { counter: 2 },
+    );
     const third = createSurface("researcher");
-    const split = calls().filter((args) => args[1] === "split").at(-1)!;
+    const split = calls()
+      .filter((args) => args[1] === "split")
+      .at(-1);
+    assert.ok(split);
     assert.equal(split[split.indexOf("--pane") + 1], first);
     closeSurface(first);
     closeSurface(second);
@@ -163,7 +211,7 @@ describe("Herdr pane operations", () => {
     const command = `printf '%s\\n' 'quotes $HOME; spaces'`;
     sendCommand("wTest:pChild", command);
     assert.deepEqual(calls()[0], ["pane", "run", "wTest:pChild", command]);
-    const scriptPath = sendLongCommand("wTest:pChild", "echo " + "x".repeat(1000), {
+    const scriptPath = sendLongCommand("wTest:pChild", `echo ${"x".repeat(1000)}`, {
       scriptPath: join(dir, "launch script.sh"),
     });
     assert.match(readFileSync(scriptPath, "utf8"), /x{1000}/);
@@ -183,7 +231,8 @@ describe("Herdr pane operations", () => {
     assert.equal(await readScreenAsync("wTest:pChild", 5), "__SUBAGENT_DONE_7__\n");
     assert.deepEqual(calls()[0], ["pane", "read", "wTest:pChild", "--source", "recent-unwrapped", "--lines", "1"]);
     assert.deepEqual(await pollForExit("wTest:pChild", new AbortController().signal, { interval: 1 }), {
-      reason: "sentinel", exitCode: 7,
+      reason: "sentinel",
+      exitCode: 7,
     });
   });
 

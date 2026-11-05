@@ -23,19 +23,24 @@ function run(args: string[]): string {
 export function createSurface(name: string): string {
   const parent = requireHerdr();
   const layout = JSON.parse(run(["layout", "--pane", parent])).result?.layout;
-  if (!Array.isArray(layout?.panes) || !layout.panes.every((pane: Pane) =>
-    typeof pane?.pane_id === "string" && pane.pane_id.length > 0 &&
-    Number.isFinite(pane.rect?.width) && pane.rect.width > 0 &&
-    Number.isFinite(pane.rect?.height) && pane.rect.height > 0,
-  )) {
+  if (
+    !Array.isArray(layout?.panes) ||
+    !layout.panes.every(
+      (pane: Pane) =>
+        typeof pane?.pane_id === "string" &&
+        pane.pane_id.length > 0 &&
+        Number.isFinite(pane.rect?.width) &&
+        pane.rect.width > 0 &&
+        Number.isFinite(pane.rect?.height) &&
+        pane.rect.height > 0,
+    )
+  ) {
     throw new Error("Invalid Herdr pane layout response: missing panes or geometry.");
   }
 
   // Only split our own children; never reuse the user's other panes.
   const children = (layout.panes as Pane[]).filter((pane) => subagentPanes.has(pane.pane_id));
-  const target = children.sort((a, b) =>
-    b.rect.width * b.rect.height - a.rect.width * a.rect.height,
-  )[0];
+  const target = children.sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height)[0];
   const direction = !target || target.rect.width <= target.rect.height * 2 ? "down" : "right";
   const pane = createSurfaceSplit(name, direction, target?.pane_id ?? parent);
   if (layout.panes.some((existing: Pane) => existing.pane_id === pane)) {
@@ -51,10 +56,9 @@ export function createSurfaceSplit(name: string, direction: Direction, fromSurfa
   if (direction !== "right" && direction !== "down") {
     throw new Error(`Herdr pane splits support right/down, not ${direction}.`);
   }
-  const response = JSON.parse(run([
-    "split", "--pane", fromSurface ?? parent, "--direction", direction,
-    "--cwd", process.cwd(), "--no-focus",
-  ]));
+  const response = JSON.parse(
+    run(["split", "--pane", fromSurface ?? parent, "--direction", direction, "--cwd", process.cwd(), "--no-focus"]),
+  );
   const pane = response.result?.pane?.pane_id;
   if (typeof pane !== "string" || !pane || pane === parent || pane === fromSurface) {
     throw new Error("Invalid Herdr pane split response: missing new pane ID.");
@@ -77,9 +81,11 @@ export function readScreen(surface: string, lines: number): string {
 
 export async function readScreenAsync(surface: string, lines: number): Promise<string> {
   requireHerdr();
-  const { stdout } = await execFileAsync("herdr", [
-    "pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines)),
-  ], CLI_OPTIONS);
+  const { stdout } = await execFileAsync(
+    "herdr",
+    ["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines))],
+    CLI_OPTIONS,
+  );
   return stdout;
 }
 

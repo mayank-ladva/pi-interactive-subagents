@@ -2,14 +2,17 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux or Herdr is available
+ * - Detect whether tmux is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in multiplexer panes
+ * - Start real pi sessions in tmux panes
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
+  accessSync,
+  constants,
   mkdtempSync,
   mkdirSync,
   cpSync,
@@ -19,22 +22,21 @@ import {
   readFileSync,
   unlinkSync,
 } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { delimiter, isAbsolute, join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
   getMuxBackend,
   createSurface,
   createSurfaceSplit,
-  sendCommand,
+  closeSurface,
   sendLongCommand,
+  shellEscape,
   readScreen,
   readScreenAsync,
-  closeSurface,
-  shellEscape,
 } from "../../pi-extension/subagents/tmux.ts";
 
-// Re-export shared pane primitives for tests
+// Re-export tmux primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -44,7 +46,7 @@ export {
   readScreenAsync,
   closeSurface,
   shellEscape,
-};
+} from "../../pi-extension/subagents/tmux.ts";
 
 // ── Paths ──
 
@@ -68,26 +70,46 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openai-codex/gpt-6-luna";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/** Return the backend used by the extension in the current environment. */
+/**
+ * Detect whether tmux is available in the current environment.
+ * Returns ["tmux"] or [].
+ */
 export function getAvailableBackends(): string[] {
   const backend = getMuxBackend();
   return backend ? [backend] : [];
 }
 
+function getTmuxExecutable(): string {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    if (!directory || !isAbsolute(directory)) continue;
+    const executable = join(directory, "tmux");
+    try {
+      accessSync(executable, constants.X_OK);
+      return executable;
+    } catch {
+      // Continue searching PATH entries that contain an executable tmux.
+    }
+  }
+  throw new Error("tmux executable not found in absolute PATH directories");
+}
+
 export function focusSurface(surface: string): void {
-  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
+  if (!/^%\d+$/.test(surface)) throw new Error(`Invalid tmux pane id: ${surface}`);
+  // Resolve tmux to an absolute executable and never invoke a shell.
+  execFileSync(getTmuxExecutable(), ["select-pane", "-t", surface], { encoding: "utf8" });
 }
 
 export function getFocusedSurface(): string | null {
   try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
+    // Resolve tmux to an absolute executable; fixed arguments avoid interpolation.
+    const panes = execFileSync(getTmuxExecutable(), ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
       encoding: "utf8",
     });
     const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
@@ -97,14 +119,11 @@ export function getFocusedSurface(): string | null {
   }
 }
 
-export async function waitForFocusedSurface(
-  surface: string,
-  timeout: number = PI_TIMEOUT,
-): Promise<void> {
+export async function waitForFocusedSurface(surface: string, timeout: number = PI_TIMEOUT): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     if (getFocusedSurface() === surface) return;
-    await sleep(200);
+    await sleep(200); // NOSONAR: Keep check-then-delay order so focus polling stays responsive.
   }
 
   throw new Error(
@@ -248,16 +267,14 @@ export async function waitForScreen(
       const screen = await readScreenAsync(surface, lines);
       if (pattern.test(screen)) return screen;
     } catch {}
-    await sleep(2000);
+    await sleep(2000); // NOSONAR: Keep check-then-delay order between screen polls.
   }
 
   let finalScreen = "";
   try {
     finalScreen = readScreen(surface, lines);
   } catch {}
-  throw new Error(
-    `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,
-  );
+  throw new Error(`Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`);
 }
 
 /**
@@ -275,25 +292,20 @@ export async function waitForFile(
       const content = readFileSync(path, "utf8");
       if (!contentPattern || contentPattern.test(content)) return content;
     }
-    await sleep(2000);
+    await sleep(2000); // NOSONAR: Keep check-then-delay order between file polls.
   }
-  throw new Error(
-    `Timeout (${timeout}ms) waiting for file: ${path}` +
-      (contentPattern ? ` matching ${contentPattern}` : ""),
-  );
+  const patternDescription = contentPattern ? " matching " : "";
+  throw new Error(`Timeout (${timeout}ms) waiting for file: ${path}${patternDescription}${contentPattern ?? ""}`);
 }
 
 /**
  * Wait for the pi process in a surface to exit (sentinel detection).
  * Returns the exit code.
  */
-export async function waitForPiExit(
-  surface: string,
-  timeout: number = PI_TIMEOUT,
-): Promise<number> {
+export async function waitForPiExit(surface: string, timeout: number = PI_TIMEOUT): Promise<number> {
   const screen = await waitForScreen(surface, /__TEST_DONE_(\d+)__/, timeout);
-  const match = screen.match(/__TEST_DONE_(\d+)__/);
-  return match ? parseInt(match[1], 10) : -1;
+  const match = /__TEST_DONE_(\d+)__/.exec(screen);
+  return match ? Number.parseInt(match[1], 10) : -1;
 }
 
 // ── Utilities ──
@@ -303,7 +315,7 @@ export function sleep(ms: number): Promise<void> {
 }
 
 export function uniqueId(): string {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  return randomUUID();
 }
 
 /**

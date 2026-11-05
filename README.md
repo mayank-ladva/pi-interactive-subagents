@@ -1,217 +1,125 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in native Herdr or tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Delegate tasks to agents in native Herdr or tmux panes while you keep working in [Pi](https://github.com/badlogic/pi-mono). Results arrive automatically when each agent finishes.
 
-**Herdr + tmux fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+This fork follows [Jonathan's implementation](https://github.com/Jonathan0823/pi-interactive-subagents/tree/633ae757180e2bb636d7a3098f48ac65ee55036c). Its intentional differences are native Herdr panes and Kilo/Nemotron model profiles; startup, completion, loadout policy, and resume behavior remain upstream.
 
-## How it works
+## Quick start
 
-`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus. In Herdr, the first child opens below Pi and the next beside it when there is room; further children split the largest child pane according to its shape. Existing user panes are never reused. In tmux, children open as right splits off the parent Pi pane. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+You need **Pi**, **Herdr or tmux**, and the **Kilo provider extension** for the bundled free model.
 
-```
-╭─ Subagents ──────────────────────────── 2 running ─╮
-│ 00:23  scout      active · bash 7m                 │
-│ 00:45  scout-2    waiting 2m                       │
-╰────────────────────────────────────────────────────╯
-```
+### 1. Install
 
-Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
-
-In tmux, panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
-
-If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
+Install this fork from GitHub:
 
 ```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
+pi install git:github.com/mayank-ladva/pi-interactive-subagents
+pi install npm:pi-kilocode
 ```
 
-## Tools
+### 2. Start Pi inside Herdr or tmux
 
-| Tool | Description |
+In a Herdr-managed pane, run `pi` from your project directory. No nested tmux is needed. Subagent panes open below Pi and then beside each other, without changing focus. Existing user panes are not reused.
+
+For tmux instead:
+
+```bash
+tmux new -A -s pi
+pi
+```
+
+Already inside tmux? Just start a new Pi session there.
+
+### 3. Choose a model
+
+Run `/subagents`, choose **scout**, and use **Change default** to save a model you have access to. Repeat for other agents you plan to use.
+
+The bundled profiles use `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free`. Its provider entrypoint is loaded using Jonathan's existing `subagentOnlyExtensions` profile setting, including fingerprint checks on resume. If Kilo returns `401 INVALID_TOKEN`, sign in with `/login kilocode`; a free model does not guarantee anonymous access through every provider/runtime version. Project/global profiles override bundled profiles; update them too if present.
+
+**Privacy:** this free trial endpoint logs requests; do not send secrets, personal information, or confidential code. Availability and free pricing can change. The existing Pi-default fallback may use a paid or subscription model.
+
+### 4. Try your first task
+
+Type this **inside Pi**, not your shell:
+
+```text
+/subagent scout Find where authentication is implemented and summarize the key files
+```
+
+A native pane opens without taking keyboard focus. You can keep working; a widget tracks progress, and the result arrives in your main conversation automatically.
+
+## Everyday use
+
+Ask Pi to delegate work in plain language:
+
+> Have a scout map the test setup, then ask a worker to add tests for the login flow.
+
+| Agent | Use it for |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated Herdr or tmux pane (async) |
-| `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
-| `subagents_list` | List available agent definitions |
-| `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
+| **scout** | Read-only codebase exploration |
+| **worker** | Implementing changes and running commands |
+| **researcher** | Web research with sources |
 
-There is also a `/subagent <agent> <task>` command for spawning directly.
+Researcher and worker web tools require separately installed extensions that provide them; this package does not include a web provider.
 
-`/subagents` provides an interactive model manager. It starts with the selected agent’s saved model and thinking level (or the parent’s current model and Pi’s configured thinking default when unset). **Spawn once** uses the chosen pair for that spawn only; **Change default** saves both together to a project-local or global agent profile. Thinking choices follow the selected model’s capabilities; for an unlisted model, Pi applies its own capability handling. Choosing **Pi default / unset** removes the profile’s `thinking` field.
+- **Start a task:** `/subagent <agent> <task>`
+- **Choose models and thinking levels:** `/subagents` — **Spawn once** makes a one-off choice; **Change default** saves it.
+- **Run tasks in parallel:** ask Pi to delegate several independent tasks.
+- **Give more work to the same agent:** ask Pi to message it by name.
 
-### Spawning
+Names such as `scout` and `scout-2` identify each run. Messaging a running agent steers it; messaging a finished agent resumes it. **Completion notifications need no acknowledgement**—only send another message when you have more work.
 
-```typescript
-subagent({ agent: "scout", task: "Analyze the auth module" });
-subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
-```
+If an agent asks a question, Pi can reply through `subagent_message`. That agent stays open while waiting for the answer.
 
-| Parameter | Type | Default | Description |
-| --------- | ---- | ------- | ----------- |
-| `agent` | string | required | Which agent to spawn (must be known and permitted) |
-| `task` | string | required | Task prompt |
-| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn |
-| `thinking` | string or `null` | agent's thinking setting | Override the level for this spawn; `null` leaves it to Pi's configured default |
-| `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
+## Make your own agent
 
-### Messaging
-
-`subagent_message` is addressed **by name only**. Names are unique per session and persist after a sub-agent finishes, so the same name works either way:
-
-```typescript
-subagent_message({ name: "scout", message: "Also check the auth middleware" });
-```
-
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
-- **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
-
-Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
-
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
-
-### ask_question
-
-A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Parallel questions are supported — each waiting sub-agent has its own name.
-
-If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the pane stays open until a human closes it. Only available inside sub-agent sessions.
-
-## Bundled agents
-
-| Agent | Model | Tools | Role |
-| ----- | ----- | ----- | ---- |
-| **scout** | `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
-
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). They also set `fallback-model: pi-default`: if the configured model ends with a provider/agent error, the extension retries once with the parent session's currently selected model.
-
-The bundled model uses **Kilo's free Nemotron 3 Ultra endpoint**. Install its provider once with `pi install npm:pi-kilocode`. Free models support anonymous access; no Z.ai key or credits are required. Restricted subagents explicitly load this provider from the standard Pi npm installation while keeping extension discovery disabled; the same sandbox helper is used on resume. Global or project-local profiles override the bundled defaults, so update their `model:` fields too if present.
-
-**Privacy and availability:** this NVIDIA endpoint is for trial use, is rate-limited, and logs requests under its provider terms. Do not send secrets, personal information, or confidential code. Free pricing and availability can change. The Pi-default fallback may use a paid or subscription-backed model.
-
-## Custom agents
-
-Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
+Create `.pi/agents/reviewer.md` in your project:
 
 ```markdown
 ---
-name: my-agent
-description: Does something specific
-model: kilocode/nvidia/nemotron-3-ultra-550b-a55b:free
-thinking: medium
-tools: read, edit, write, safe_bash, web_search
-session-mode: lineage-only
+name: reviewer
+description: Reviews changes for bugs
+tools: read, grep, find, ls
+system-prompt: append
 auto-exit: true
 ---
 
-You are a specialized agent that does X...
+Review the requested code for bugs. Do not edit files.
+Report findings with file paths and suggested fixes.
 ```
 
-### Frontmatter reference
+Then run `/subagent reviewer Review the latest changes` inside Pi. With no `model` set, the agent uses Pi's configured default. You can choose a saved model through `/subagents`.
 
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `name` | string | Agent name (used in `agent: "my-agent"`) |
-| `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model |
-| `fallback-model` | `pi-default` | Retry once with the parent session's current model after a provider/agent error. Pi CLI agents only; no retry if the parent model is unavailable or identical to the primary model |
-| `thinking` | string | `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` (subject to model support); omit for Pi's configured default |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
-| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
-| `skills` | string | Comma-separated skill names to auto-load |
-| `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
-| `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
-| `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
-| `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
-| `cwd` | string | Default working directory |
-| `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
-| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
+For agents shared across projects, put the file in `~/.pi/agent/agents/`. Project profiles override global and bundled profiles with the same name.
 
-### session-mode
+## More help
 
-- `standalone` — fresh session, no lineage link to the caller (default)
-- `lineage-only` — fresh session with `parentSession` linkage for discovery/fork UX, but no copied turns
-- `fork` — child session seeded with the caller's conversation context
+- [Tool parameters and commands](docs/reference.md#tools)
+- [All agent profile options](docs/reference.md#frontmatter-reference)
+- [Extensions, MCP, and access control](docs/reference.md#tool-access-control)
+- [Status widget and configuration](docs/reference.md#status-widget--configuration)
+- [Slow shell startup](docs/reference.md#how-it-works)
 
-### auto-exit
-
-With `auto-exit: true`, the session shuts down when the agent's turn ends — the agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
-
-Notes:
-
-- **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
-- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
-
-### interactive
-
-Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
-
-## Tool access control
-
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
-
-Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
-
-Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
-
-## Role folders
-
-`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:
-
-```
-project/
-└── agents/
-    ├── game-designer/   ← CLAUDE.md, .pi/…
-    └── sre/             ← CLAUDE.md, .pi/…
-```
-
-```typescript
-subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipeline" });
-```
-
-Set a per-agent default with `cwd:` in frontmatter.
-
-## Status widget & configuration
-
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
-
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
-
-```json
-{
-  "status": { "enabled": true }
-}
-```
-
-## Requirements
-
-- [pi](https://github.com/badlogic/pi-mono)
-- Either [Herdr](https://herdr.dev) or [tmux](https://github.com/tmux/tmux)
-
-In Herdr, start `pi` in a Herdr-managed pane. No nested tmux is needed. The extension detects `HERDR_ENV=1` and `HERDR_PANE_ID`, and requires the `herdr` CLI on PATH. When Pi runs inside tmux (even within Herdr), tmux takes precedence.
-
-For tmux:
-
-```bash
-tmux new -A -s pi 'pi'
-```
-
-Subagent panes close automatically when the existing completion watcher finishes. Herdr operations always target explicit pane IDs and preserve the caller's working directory.
-
-### Development checks
-
-```bash
-npm install
-npm test
-npm run test:panes          # model-free pane checks; run inside Herdr or tmux
-npm run test:integration    # also runs real model-backed lifecycle tests
-```
-
-Lifecycle tests require working model authentication (API key or saved Pi login); `PI_TEST_MODEL` overrides their default `anthropic/claude-haiku-4-5` model. Pane checks make no model calls. To try this working-tree extension without loading an installed copy, run `pi -ne -e ./pi-extension/subagents/index.ts` from this directory.
+Agents can use real files, commands, and configured services. Tool restrictions are **not an OS sandbox**; read the [security limitations](docs/reference.md#explicit-loadouts-pi-140) before using advanced loadouts.
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+This Herdr/Kilo adaptation builds on [Jonathan0823/pi-interactive-subagents](https://github.com/Jonathan0823/pi-interactive-subagents), which builds on [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which also supports cmux, zellij, and WezTerm. Its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+
+## Development checks
+
+```bash
+npm ci --ignore-scripts
+npm run format:check
+npm run lint
+npm run build
+npm test
+npm run test:panes          # model-free checks inside Herdr or tmux
+npm run test:loadout:cli    # upstream no-auth loadout checks
+npm run test:completion:cli # upstream no-auth completion checks
+```
+
+After editing an already-loaded checkout, run `/reload` in Pi before testing new agents.
 
 ## License
 

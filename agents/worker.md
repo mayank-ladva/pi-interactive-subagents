@@ -4,6 +4,8 @@ description: General-purpose worker — reads, writes, and edits code
 tools: read, write, edit, bash, web_search, web_fetch
 subagent_agents: scout, researcher
 model: kilocode/nvidia/nemotron-3-ultra-550b-a55b:free
+subagentOnlyExtensions:
+  - ~/.pi/agent/npm/node_modules/pi-kilocode/src/index.ts
 fallback-model: pi-default
 thinking: high
 system-prompt: append

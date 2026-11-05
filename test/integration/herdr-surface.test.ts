@@ -4,15 +4,34 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { getMuxBackend, pollForExit } from "../../pi-extension/subagents/tmux.ts";
+import { buildProcessExitCommand } from "../../pi-extension/subagents/startup.ts";
 import {
-  cleanupTestEnv, createTestEnv, createTrackedSurface, readScreen, readScreenAsync,
-  sendCommand, sendLongCommand, sleep, uniqueId, waitForFile, waitForScreen, type TestEnv,
+  cleanupTestEnv,
+  createTestEnv,
+  createTrackedSurface,
+  readScreen,
+  readScreenAsync,
+  sendCommand,
+  sendLongCommand,
+  shellEscape,
+  sleep,
+  uniqueId,
+  waitForFile,
+  waitForScreen,
+  type TestEnv,
 } from "./harness.ts";
 
-function layout() {
-  return JSON.parse(execFileSync("herdr", ["pane", "layout", "--pane", process.env.HERDR_PANE_ID!], {
-    encoding: "utf8", timeout: 10_000,
-  })).result.layout;
+type LayoutPane = { pane_id: string; rect: { x: number; y: number } };
+
+function layout(): { panes: LayoutPane[]; focused_pane_id: string } {
+  const parent = process.env.HERDR_PANE_ID;
+  assert.ok(parent);
+  return JSON.parse(
+    execFileSync("herdr", ["pane", "layout", "--pane", parent], {
+      encoding: "utf8",
+      timeout: 10_000,
+    }),
+  ).result.layout;
 }
 
 describe("Herdr surfaces", { skip: getMuxBackend() !== "herdr", timeout: 45_000 }, () => {
@@ -30,15 +49,16 @@ describe("Herdr surfaces", { skip: getMuxBackend() !== "herdr", timeout: 45_000 
   });
   after(() => {
     cleanupTestEnv(env);
-    const remaining = layout().panes.map((pane: any) => pane.pane_id);
+    const remaining = layout().panes.map((pane) => pane.pane_id);
     assert.ok(!remaining.includes(first) && !remaining.includes(second), "test panes should be closed");
   });
 
   it("creates two native panes below Pi, side by side, without changing focus", () => {
     const current = layout();
-    const parent = current.panes.find((pane: any) => pane.pane_id === process.env.HERDR_PANE_ID);
-    const a = current.panes.find((pane: any) => pane.pane_id === first);
-    const b = current.panes.find((pane: any) => pane.pane_id === second);
+    const parent = current.panes.find((pane) => pane.pane_id === process.env.HERDR_PANE_ID);
+    const a = current.panes.find((pane) => pane.pane_id === first);
+    const b = current.panes.find((pane) => pane.pane_id === second);
+    assert.ok(parent && a && b);
     assert.equal(current.focused_pane_id, originalFocus);
     assert.ok(a.rect.y > parent.rect.y);
     assert.equal(a.rect.y, b.rect.y);
@@ -64,11 +84,29 @@ describe("Herdr surfaces", { skip: getMuxBackend() !== "herdr", timeout: 45_000 
   it("runs a long launch script and detects completion through the shared watcher", async () => {
     const marker = uniqueId();
     const scriptPath = join(env.dir, "launch script.sh");
-    sendLongCommand(first, `printf '%s\\n' '${"X".repeat(500)}'; printf '__SUBAGENT_'; printf 'DONE_0__\\n'; printf '${marker}\\n'`, { scriptPath });
+    sendLongCommand(
+      first,
+      `printf '%s\\n' '${"X".repeat(500)}'; printf '__SUBAGENT_'; printf 'DONE_0__\\n'; printf '${marker}\\n'`,
+      { scriptPath },
+    );
     await waitForScreen(first, new RegExp(marker), 15_000, 200);
     assert.deepEqual(await pollForExit(first, AbortSignal.timeout(10_000), { interval: 100 }), {
-      reason: "sentinel", exitCode: 0,
+      reason: "sentinel",
+      exitCode: 0,
     });
     assert.equal(layout().focused_pane_id, originalFocus);
+  });
+
+  it("uses upstream durable process-exit records through Herdr", async () => {
+    const processExitFile = join(env.dir, "child.process-exit");
+    sendLongCommand(second, buildProcessExitCommand("exit 17", processExitFile, shellEscape), {
+      scriptPath: join(env.dir, "process-exit.sh"),
+    });
+    const content = await waitForFile(processExitFile, 10_000);
+    assert.deepEqual(JSON.parse(content), { type: "process_exit", exitCode: 17 });
+    assert.deepEqual(await pollForExit(second, AbortSignal.timeout(10_000), { interval: 100, processExitFile }), {
+      reason: "sentinel",
+      exitCode: 17,
+    });
   });
 });

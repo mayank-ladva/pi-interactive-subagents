@@ -1,10 +1,13 @@
 import { describe, it, before, after, beforeEach } from "node:test";
+import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext, Theme, KeybindingsManager } from "@mariozechner/pi-coding-agent";
+import type { TUI, Component } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -28,9 +31,25 @@ import {
   mergeNewEntries,
   seedSubagentSessionFile,
   summarizeSessionStats,
+  type SessionEntry,
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { publishSubagentCompletion } from "../pi-extension/subagents/completion.ts";
+import { buildProcessExitCommand, buildStartupDeadlineCommand } from "../pi-extension/subagents/startup.ts";
+import {
+  appendExplicitLoadoutArgs,
+  authorizeToolCall,
+  CHILD_ONLY_EXTENSION_PROVIDER,
+  createExplicitLoadoutSnapshot,
+  fingerprintExtension,
+  resolveExplicitLoadout,
+  snapshotToolProviders,
+  validateExplicitLoadoutSnapshot,
+  validateToolProviderGrants,
+} from "../pi-extension/subagents/loadout.ts";
+import { fingerprintMcpServerConfig, resolveMcpServerIdentities } from "../pi-extension/subagents/mcp-identity.ts";
+import { createToolPolicyHandlers } from "../pi-extension/subagents/tool-policy.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -51,12 +70,14 @@ import {
 } from "../pi-extension/subagents/activity.ts";
 import {
   shouldMarkUserTookOver,
+  shouldBlockSubagentInputForLoadout,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   runningChildrenCount,
+  writeSubagentShutdownRequest,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__, pollForExit } from "../pi-extension/subagents/tmux.ts";
 
 // --- Helpers ---
 
@@ -82,9 +103,17 @@ function withTempDir(run: (dir: string) => void) {
 
 function chooseFromCustomModelPicker(index: number | number[] = 0) {
   let callIndex = 0;
-  return async (factory: any, options?: { overlay?: boolean }) => {
+  return async <T>(
+    factory: (
+      tui: TUI,
+      theme: Theme,
+      keybindings: KeybindingsManager,
+      done: (result: T) => void,
+    ) => Component & { handleInput(data: string): void },
+    options?: { overlay?: boolean },
+  ): Promise<T | undefined> => {
     assert.notEqual(options?.overlay, true, "the model picker should replace the input, not open as an overlay");
-    let selected: string | undefined;
+    let selected: T | undefined;
     const actions: Record<string, string> = {
       "tui.select.up": "UP",
       "tui.select.down": "DOWN",
@@ -92,13 +121,15 @@ function chooseFromCustomModelPicker(index: number | number[] = 0) {
       "tui.select.cancel": "ESC",
     };
     const component = factory(
-      { requestRender() {} },
-      { fg: (_color: string, text: string) => text },
-      { matches: (data: string, action: string) => data === actions[action] },
-      (value: string | undefined) => { selected = value; },
+      { requestRender() {} } as TUI,
+      { fg: (_color: string, text: string) => text } as Theme,
+      { matches: (data: string, action: string) => data === actions[action] } as KeybindingsManager,
+      (value: T) => {
+        selected = value;
+      },
     );
     component.render(120);
-    const moves = Array.isArray(index) ? index[callIndex] ?? 0 : index;
+    const moves = Array.isArray(index) ? (index[callIndex] ?? 0) : index;
     callIndex++;
     for (let i = 0; i < Math.abs(moves); i++) component.handleInput(moves < 0 ? "UP" : "DOWN");
     component.handleInput("ENTER");
@@ -106,12 +137,174 @@ function chooseFromCustomModelPicker(index: number | number[] = 0) {
   };
 }
 
+type RunningSubagent = typeof subagentsModule.__test__.runningSubagents extends Map<string, infer T> ? T : never;
+type ResolvedToolProvider = Parameters<typeof createToolPolicyHandlers>[0][number];
+type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
+type TestAgent = ReturnType<typeof subagentsModule.__test__.discoverAgentDefinitions>[number];
+type TestToolResult = {
+  content: Array<{ type: string; text?: string }>;
+  details?: { agents?: TestAgent[]; error?: string; [key: string]: unknown };
+};
+type TestToolParameter = { description?: string; type?: string };
+type TestRegisteredTool = {
+  name: string;
+  description: string;
+  promptSnippet?: string;
+  parameters: { properties: Record<string, TestToolParameter>; required?: string[] };
+  execute(
+    toolCallId?: string,
+    params?: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: (...args: unknown[]) => void,
+    context?: Partial<Pick<ExtensionContext, "cwd">> & { shutdown?(): void },
+  ): Promise<TestToolResult> | TestToolResult;
+  renderCall?: (params: Record<string, unknown>, theme: Theme) => Component;
+};
+type RegisteredToolResult = TestToolResult;
+
+function adaptRegisteredTool(tool: RegisteredTool): TestRegisteredTool {
+  return tool as unknown as TestRegisteredTool;
+}
+
+function adaptRegisteredCommand(name: string, options: RegisteredCommandOptions): TestRegisteredCommand {
+  return { name, ...options } as unknown as TestRegisteredCommand;
+}
+
+function findRegisteredCommand(commands: TestRegisteredCommand[], name: string): TestRegisteredCommand {
+  const command = commands.find((candidate) => candidate.name === name);
+  if (!command) throw new Error(`Expected /${name} to be registered`);
+  return command;
+}
+
+type TestModelLike = {
+  id: string;
+  provider?: string;
+  name?: string;
+  contextWindow?: number;
+  reasoning?: boolean;
+};
+type TestHelpers = Omit<
+  typeof subagentsModule.__test__,
+  "preferredModelId" | "modelPickerItems" | "thinkingLevelsForModel" | "thinkingPickerItems"
+> & {
+  preferredModelId(agentModel: string | undefined, currentModel: TestModelLike | undefined): string | undefined;
+  modelPickerItems(
+    models: TestModelLike[],
+    preferredModel?: string,
+  ): ReturnType<typeof subagentsModule.__test__.modelPickerItems>;
+  thinkingLevelsForModel(
+    model?: TestModelLike,
+    xhighSupport?: Parameters<typeof subagentsModule.__test__.thinkingLevelsForModel>[1],
+  ): ReturnType<typeof subagentsModule.__test__.thinkingLevelsForModel>;
+  thinkingPickerItems(
+    model: TestModelLike | undefined,
+    savedThinking?: string,
+  ): ReturnType<typeof subagentsModule.__test__.thinkingPickerItems>;
+};
+const testHelpers = subagentsModule.__test__ as unknown as TestHelpers;
+
+function findRegisteredTool(tools: TestRegisteredTool[], name: string): TestRegisteredTool {
+  const tool = tools.find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`Expected ${name} to be registered`);
+  return tool;
+}
+
+async function executeRegisteredTool(
+  tool: TestRegisteredTool,
+  params?: Record<string, unknown>,
+  context?: Partial<Pick<ExtensionContext, "cwd">> & { shutdown?(): void },
+): Promise<RegisteredToolResult> {
+  if (params === undefined && context === undefined) return tool.execute();
+  return tool.execute("test-tool-call", params ?? {}, undefined, undefined, context);
+}
+
+function assertResolvedRunning(
+  result: ReturnType<typeof subagentsModule.__test__.resolveRunningByName>,
+): asserts result is { running: RunningSubagent } {
+  if (!("running" in result)) throw new Error(result.error);
+}
+
+function assertToolError(
+  result: ReturnType<typeof subagentsModule.__test__.steerSubagent>,
+): asserts result is { error: string } {
+  if (!("error" in result)) throw new Error("Expected an error result");
+}
+
+function assertResolveError(
+  result: ReturnType<typeof subagentsModule.__test__.resolveRunningByName>,
+): asserts result is { error: string } {
+  if (!("error" in result)) throw new Error("Expected name resolution error");
+}
+
+function getRunning(running: Map<string, RunningSubagent>, id: string): RunningSubagent {
+  const entry = running.get(id);
+  if (!entry) throw new Error(`Missing running subagent ${id}`);
+  return entry;
+}
+
+function textFromToolResult(result: RegisteredToolResult): string {
+  const item = result.content.find((content) => content.type === "text");
+  if (!item || !("text" in item) || typeof item.text !== "string") {
+    throw new Error("Expected tool result to contain text");
+  }
+  return item.text;
+}
+
+function agentsFromToolResult(result: RegisteredToolResult): TestAgent[] {
+  if (!result.details || typeof result.details !== "object" || !("agents" in result.details)) {
+    throw new Error("Expected tool result to contain agents");
+  }
+  const agents = result.details.agents;
+  if (!Array.isArray(agents)) throw new Error("Expected agents to be an array");
+  return agents.filter(
+    (agent): agent is TestAgent =>
+      typeof agent === "object" && agent !== null && "name" in agent && typeof agent.name === "string",
+  );
+}
+type RegisteredCommandOptions = Parameters<ExtensionAPI["registerCommand"]>[1];
+type TestModel = { provider: string; id: string; name: string; contextWindow: number; reasoning?: boolean };
+type TestCommandContext = {
+  cwd?: string;
+  mode?: string;
+  model?: TestModel;
+  modelRegistry?: { getAvailable(): TestModel[] };
+  ui: {
+    custom?: ReturnType<typeof chooseFromCustomModelPicker>;
+    select?: (title: string, options: string[]) => Promise<string | undefined>;
+    input?: (title: string) => Promise<string | undefined>;
+    notify?: (message: string, level?: "error" | "info" | "warning") => void;
+  };
+};
+type TestRegisteredCommand = {
+  name: string;
+  description?: string;
+  handler(args: string, context: TestCommandContext): Promise<void>;
+};
+type RegisteredMessageRenderer = Parameters<ExtensionAPI["registerMessageRenderer"]>[1];
+type TestTheme = {
+  fg(color: string, text: string): string;
+  bg(color: string, text: string): string;
+  bold(text: string): string;
+};
+type TestMessageRenderer = (
+  message: {
+    role?: string;
+    display?: boolean;
+    timestamp?: number;
+    customType: string;
+    content: string;
+    details?: unknown;
+  },
+  options: { expanded: boolean },
+  theme: TestTheme,
+) => Component | undefined;
+
 function createMockExtensionApi() {
-  const registeredTools: Array<any> = [];
-  const registeredCommands: Array<any> = [];
-  const registeredMessageRenderers: Array<any> = [];
+  const registeredTools: TestRegisteredTool[] = [];
+  const registeredCommands: TestRegisteredCommand[] = [];
+  const registeredMessageRenderers: Array<{ name: string; renderer: TestMessageRenderer }> = [];
   const sentUserMessages: string[] = [];
-  const sentMessages: Array<any> = [];
+  const sentMessages: Array<unknown> = [];
   return {
     registeredTools,
     registeredCommands,
@@ -120,27 +313,35 @@ function createMockExtensionApi() {
     sentMessages,
     api: {
       on() {},
-      registerTool(tool: any) {
-        registeredTools.push(tool);
+      registerTool(tool: RegisteredTool) {
+        registeredTools.push(adaptRegisteredTool(tool));
       },
-      registerCommand(name: string, command: any) {
-        registeredCommands.push({ name, ...command });
+      registerCommand(name: string, command: RegisteredCommandOptions) {
+        registeredCommands.push(adaptRegisteredCommand(name, command));
       },
-      registerMessageRenderer(name: string, renderer: any) {
-        registeredMessageRenderers.push({ name, renderer });
+      registerMessageRenderer(name: string, renderer: RegisteredMessageRenderer) {
+        registeredMessageRenderers.push({ name, renderer: renderer as unknown as TestMessageRenderer });
       },
       registerShortcut() {},
       sendUserMessage(message: string) {
         sentUserMessages.push(message);
       },
-      sendMessage(message: any, options?: any) {
+      sendMessage(
+        message: Parameters<ExtensionAPI["sendMessage"]>[0],
+        options?: Parameters<ExtensionAPI["sendMessage"]>[1],
+      ) {
         sentMessages.push({ message, options });
       },
       getAllTools() {
         return [];
       },
-    } as any,
+    } as unknown as ExtensionAPI,
   };
+}
+
+function deniedToolCallReason(result: ReturnType<typeof authorizeToolCall>): string {
+  if (result.allowed) throw new Error("expected tool call to be denied");
+  return result.reason;
 }
 
 function restoreEnvVar(name: string, value: string | undefined) {
@@ -161,12 +362,7 @@ function withMockedNow<T>(now: number, fn: () => T): T {
   }
 }
 
-function writeAgentFile(
-  agentsDir: string,
-  name: string,
-  frontmatter: string,
-  body = "You are a test agent.",
-) {
+function writeAgentFile(agentsDir: string, name: string, frontmatter: string, body = "You are a test agent.") {
   mkdirSync(agentsDir, { recursive: true });
   writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
 }
@@ -368,6 +564,7 @@ describe("session.ts", () => {
       writeSubagentLoadout(sf, sample);
       assert.equal(loadoutSidecarPath(sf), sf + ".loadout.json");
       assert.ok(existsSync(sf + ".loadout.json"));
+      assert.equal(statSync(sf + ".loadout.json").mode & 0o777, 0o600);
     });
 
     it("round-trips the full loadout", () => {
@@ -404,7 +601,7 @@ describe("session.ts", () => {
       assert.deepEqual(Object.keys(reg).sort(), ["scout", "scout-2"]);
       // Overwrite scout with a new session file.
       registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
-      assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
+      assert.equal(resolveNameInRegistry(adir, "scout")?.sessionFile, "/s/scout-new.jsonl");
     });
 
     it("returns null for unknown names and {} for a missing/corrupt registry", () => {
@@ -419,25 +616,25 @@ describe("session.ts", () => {
 
   describe("findLastAssistantMessage", () => {
     it("finds last assistant text", () => {
-      const entries = [USER_MSG, ASSISTANT_MSG, ASSISTANT_MSG_2] as any[];
+      const entries: SessionEntry[] = [USER_MSG, ASSISTANT_MSG, ASSISTANT_MSG_2];
       const text = findLastAssistantMessage(entries);
       assert.equal(text, "Updated plan with details.");
     });
 
     it("skips thinking blocks, gets text only", () => {
-      const entries = [ASSISTANT_MSG_2] as any[];
+      const entries: SessionEntry[] = [ASSISTANT_MSG_2];
       const text = findLastAssistantMessage(entries);
       assert.equal(text, "Updated plan with details.");
     });
 
     it("skips tool results", () => {
-      const entries = [ASSISTANT_MSG, TOOL_RESULT] as any[];
+      const entries: SessionEntry[] = [ASSISTANT_MSG, TOOL_RESULT];
       const text = findLastAssistantMessage(entries);
       assert.equal(text, "Here is my plan...");
     });
 
     it("returns null when no assistant messages", () => {
-      const entries = [USER_MSG] as any[];
+      const entries: SessionEntry[] = [USER_MSG];
       assert.equal(findLastAssistantMessage(entries), null);
     });
 
@@ -448,6 +645,7 @@ describe("session.ts", () => {
     it("skips empty assistant messages and returns real content above", () => {
       const realMsg = {
         type: "message",
+        id: "real-message",
         message: {
           role: "assistant",
           content: [{ type: "text", text: "Real summary content." }],
@@ -455,12 +653,13 @@ describe("session.ts", () => {
       };
       const emptyMsg = {
         type: "message",
+        id: "empty-message",
         message: {
           role: "assistant",
           content: [],
         },
       };
-      const entries = [realMsg, emptyMsg] as any[];
+      const entries: SessionEntry[] = [realMsg, emptyMsg];
       assert.equal(findLastAssistantMessage(entries), "Real summary content.");
     });
 
@@ -471,6 +670,7 @@ describe("session.ts", () => {
       // the orchestrator would believe the subagent completed.
       const earlierGood = {
         type: "message",
+        id: "earlier-good",
         message: {
           role: "assistant",
           content: [{ type: "text", text: "Investigating the bug..." }],
@@ -478,6 +678,7 @@ describe("session.ts", () => {
       };
       const overloadError = {
         type: "message",
+        id: "overload-error",
         message: {
           role: "assistant",
           content: [],
@@ -485,11 +686,8 @@ describe("session.ts", () => {
           errorMessage: "Anthropic 529 Overloaded after 3 retries",
         },
       };
-      const entries = [earlierGood, overloadError] as any[];
-      assert.equal(
-        findLastAssistantMessage(entries),
-        "Subagent error: Anthropic 529 Overloaded after 3 retries",
-      );
+      const entries: SessionEntry[] = [earlierGood, overloadError];
+      assert.equal(findLastAssistantMessage(entries), "Subagent error: Anthropic 529 Overloaded after 3 retries");
     });
 
     it("prefers text content even when an error stopReason is set", () => {
@@ -497,6 +695,7 @@ describe("session.ts", () => {
       // prefer the actual content over the synthetic error fallback.
       const msg = {
         type: "message",
+        id: "partial-output",
         message: {
           role: "assistant",
           content: [{ type: "text", text: "Here is partial output." }],
@@ -504,19 +703,20 @@ describe("session.ts", () => {
           errorMessage: "stream interrupted",
         },
       };
-      assert.equal(findLastAssistantMessage([msg] as any[]), "Here is partial output.");
+      assert.equal(findLastAssistantMessage([msg]), "Here is partial output.");
     });
 
     it("does not invent a summary for a stop=error message with no errorMessage", () => {
       const msg = {
         type: "message",
+        id: "empty-error",
         message: {
           role: "assistant",
           content: [],
           stopReason: "error",
         },
       };
-      assert.equal(findLastAssistantMessage([msg] as any[]), null);
+      assert.equal(findLastAssistantMessage([msg]), null);
     });
   });
 
@@ -605,8 +805,14 @@ describe("session.ts", () => {
       assert.equal(entries[0].parentSession, parentFile);
       assert.equal(entries[0].cwd, "/tmp/fork-child-cwd");
       assert.equal(entries[1].type, "model_change");
-      assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
-      assert.equal(entries.some((entry) => entry.type === "message"), false);
+      assert.equal(
+        entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile),
+        false,
+      );
+      assert.equal(
+        entries.some((entry) => entry.type === "message"),
+        false,
+      );
     });
   });
 
@@ -619,10 +825,7 @@ describe("session.ts", () => {
         sourceFile,
         [SESSION_HEADER, USER_MSG, ASSISTANT_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
       );
-      writeFileSync(
-        targetFile,
-        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
-      );
+      writeFileSync(targetFile, [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n");
 
       // Merge entries after line 2 (the shared base)
       const merged = mergeNewEntries(sourceFile, targetFile, 2);
@@ -636,11 +839,14 @@ describe("session.ts", () => {
   });
 
   describe("summarizeSessionStats", () => {
-    const asstWithUsage = (id: string, opts: {
-      model?: string;
-      tools?: string[];
-      usage?: Record<string, unknown>;
-    }) => ({
+    const asstWithUsage = (
+      id: string,
+      opts: {
+        model?: string;
+        tools?: string[];
+        usage?: Record<string, unknown>;
+      },
+    ) => ({
       type: "message",
       id,
       parentId: "user-001",
@@ -662,14 +868,29 @@ describe("session.ts", () => {
         USER_MSG,
         asstWithUsage("a1", {
           tools: ["read", "grep"],
-          usage: { input: 100, output: 50, cacheRead: 1000, cacheWrite: 200, totalTokens: 1350, cost: { total: 0.01 } },
+          usage: {
+            input: 100,
+            output: 50,
+            cacheRead: 1000,
+            cacheWrite: 200,
+            totalTokens: 1350,
+            cost: { total: 0.01 },
+          },
         }),
         asstWithUsage("a2", {
           tools: ["write"],
-          usage: { input: 30, output: 70, cacheRead: 2000, cacheWrite: 0, totalTokens: 3500, cost: { total: 0.02 } },
+          usage: {
+            input: 30,
+            output: 70,
+            cacheRead: 2000,
+            cacheWrite: 0,
+            totalTokens: 3500,
+            cost: { total: 0.02 },
+          },
         }),
       ]);
-      const stats = summarizeSessionStats(file)!;
+      const stats = summarizeSessionStats(file);
+      assert.ok(stats);
       assert.equal(stats.model, "claude-sonnet-4-6");
       assert.equal(stats.toolCount, 3);
       assert.equal(stats.inputTokens, 130);
@@ -685,14 +906,20 @@ describe("session.ts", () => {
       const file = createSessionFile(dir, [
         SESSION_HEADER,
         { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-haiku-4-5" },
-        asstWithUsage("a1", { model: "claude-sonnet-4-6", usage: { totalTokens: 10, cost: { total: 0 } } }),
+        asstWithUsage("a1", {
+          model: "claude-sonnet-4-6",
+          usage: { totalTokens: 10, cost: { total: 0 } },
+        }),
       ]);
-      assert.equal(summarizeSessionStats(file)!.model, "claude-sonnet-4-6");
+      const stats = summarizeSessionStats(file);
+      assert.ok(stats);
+      assert.equal(stats.model, "claude-sonnet-4-6");
     });
 
     it("handles missing usage gracefully", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
-      const stats = summarizeSessionStats(file)!;
+      const stats = summarizeSessionStats(file);
+      assert.ok(stats);
       assert.equal(stats.toolCount, 0);
       assert.equal(stats.inputTokens, 0);
       assert.equal(stats.cost, 0);
@@ -728,10 +955,7 @@ describe("status.ts", () => {
   it("loads the shared example when local config is absent", () => {
     withTempDir((dir) => {
       const examplePath = join(dir, "config.json.example");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }, null, 2) + "\n");
 
       const config = loadStatusConfig(join(dir, "config.json"), examplePath);
 
@@ -743,10 +967,7 @@ describe("status.ts", () => {
   });
 
   it("fails fast for invalid config shapes", () => {
-    assert.throws(
-      () => parseStatusConfig({ status: { enabled: "false" } }),
-      /status\.enabled must be a boolean/,
-    );
+    assert.throws(() => parseStatusConfig({ status: { enabled: "false" } }), /status\.enabled must be a boolean/);
     assert.throws(
       () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
       /status has unsupported key\(s\): defaultCadenceSeconds/,
@@ -779,15 +1000,9 @@ describe("status.ts", () => {
       const configPath = join(dir, "config.json");
       const examplePath = join(dir, "config.json.example");
       writeFileSync(configPath, "{\n");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }, null, 2) + "\n");
 
-      assert.throws(
-        () => loadStatusConfig(configPath, examplePath),
-        /Invalid JSON in subagent config .*config\.json/,
-      );
+      assert.throws(() => loadStatusConfig(configPath, examplePath), /Invalid JSON in subagent config .*config\.json/);
     });
   });
 
@@ -803,17 +1018,21 @@ describe("status.ts", () => {
 
   it("classifies active snapshots without aging into stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-      latestEvent: "tool_execution_start",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+        latestEvent: "tool_execution_start",
+      },
+      5_000,
+    );
 
     const snapshot = classifyStatus(state, 240_000);
     assert.equal(snapshot.kind, "active");
@@ -823,14 +1042,18 @@ describe("status.ts", () => {
 
   it("classifies waiting snapshots as healthy idle without becoming stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 10_000,
-      sequence: 1,
-      phase: "waiting",
-      waitingSince: 10_000,
-      latestEvent: "agent_end",
-    }, 10_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 10_000,
+        sequence: 1,
+        phase: "waiting",
+        waitingSince: 10_000,
+        latestEvent: "agent_end",
+      },
+      10_000,
+    );
 
     const snapshot = classifyStatus(state, 240_000);
     assert.equal(snapshot.kind, "waiting");
@@ -853,14 +1076,18 @@ describe("status.ts", () => {
     assert.equal(advanced.transition, "stalled");
     assert.equal(advanced.snapshot.kind, "stalled");
 
-    state = observeStatus(advanced.nextState, {
-      snapshot: "present",
-      updatedAt: 96_000,
-      sequence: 1,
-      phase: "waiting",
-      waitingSince: 96_000,
-      latestEvent: "agent_end",
-    }, 96_000);
+    state = observeStatus(
+      advanced.nextState,
+      {
+        snapshot: "present",
+        updatedAt: 96_000,
+        sequence: 1,
+        phase: "waiting",
+        waitingSince: 96_000,
+        latestEvent: "agent_end",
+      },
+      96_000,
+    );
     advanced = advanceStatusState(state, 97_000);
     assert.equal(advanced.transition, "recovered");
     assert.equal(advanced.snapshot.kind, "waiting");
@@ -868,15 +1095,19 @@ describe("status.ts", () => {
 
   it("keeps the last healthy kind during transient snapshot loss", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "streaming",
-      activeSince: 5_000,
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "streaming",
+        activeSince: 5_000,
+      },
+      5_000,
+    );
     state = advanceStatusState(state, 6_000).nextState;
     state = observeStatus(state, { snapshot: "missing" }, 10_000);
 
@@ -888,16 +1119,20 @@ describe("status.ts", () => {
   it("forces an active state to waiting after interrupt", () => {
     const now = 20_000;
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
 
     assert.equal(classifyStatus(state, now).kind, "active");
 
@@ -912,25 +1147,33 @@ describe("status.ts", () => {
 
   it("orders same-millisecond snapshots by sequence", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 10_000,
-      sequence: 2,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 10_000,
-      activityLabel: "bash",
-    }, 10_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 10_000,
+        sequence: 2,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 10_000,
+        activityLabel: "bash",
+      },
+      10_000,
+    );
 
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 10_000,
-      sequence: 3,
-      phase: "waiting",
-      waitingSince: 10_000,
-      latestEvent: "agent_end",
-    }, 10_001);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 10_000,
+        sequence: 3,
+        phase: "waiting",
+        waitingSince: 10_000,
+        latestEvent: "agent_end",
+      },
+      10_001,
+    );
 
     const snapshot = classifyStatus(state, 11_000);
     assert.equal(snapshot.kind, "waiting");
@@ -939,29 +1182,37 @@ describe("status.ts", () => {
 
   it("recovers from a transient snapshot read failure with the same valid snapshot", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 2,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 2,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
     state = observeStatus(state, { snapshot: "missing" }, 10_000);
     assert.equal(classifyStatus(state, 10_000).statusLabel, null);
 
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 2,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 11_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 2,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      11_000,
+    );
 
     const snapshot = classifyStatus(state, 11_000);
     assert.equal(snapshot.kind, "active");
@@ -970,56 +1221,72 @@ describe("status.ts", () => {
 
   it("ignores stale and exact old snapshots after interrupt and accepts newer snapshots", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
-    state = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 5_000);
+    state = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
     state = forceStatusAfterInterrupt(state, 20_000);
 
-    const stale = observeStatus(state, {
-      snapshot: "present",
-      updatedAt: 5_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 5_000,
-      activityLabel: "bash",
-    }, 21_000);
+    const stale = observeStatus(
+      state,
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      21_000,
+    );
     let snapshot = classifyStatus(stale, 21_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.activityLabel, "interrupted");
 
-    const sameTimestamp = observeStatus(stale, {
-      snapshot: "present",
-      updatedAt: 20_000,
-      sequence: 1,
-      phase: "active",
-      active: true,
-      activeScope: "tool",
-      activeSince: 20_000,
-      activityLabel: "bash",
-    }, 22_000);
+    const sameTimestamp = observeStatus(
+      stale,
+      {
+        snapshot: "present",
+        updatedAt: 20_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 20_000,
+        activityLabel: "bash",
+      },
+      22_000,
+    );
     snapshot = classifyStatus(sameTimestamp, 22_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.activityLabel, "interrupted");
 
-    const resumed = observeStatus(sameTimestamp, {
-      snapshot: "present",
-      sequence: 2,
-      updatedAt: 25_000,
-      phase: "active",
-      active: true,
-      activeScope: "streaming",
-      activeSince: 25_000,
-      activityLabel: "streaming",
-    }, 25_000);
+    const resumed = observeStatus(
+      sameTimestamp,
+      {
+        snapshot: "present",
+        sequence: 2,
+        updatedAt: 25_000,
+        phase: "active",
+        active: true,
+        activeScope: "streaming",
+        activeSince: 25_000,
+        activityLabel: "streaming",
+      },
+      25_000,
+    );
     snapshot = classifyStatus(resumed, 25_000);
     assert.equal(snapshot.kind, "active");
     assert.equal(resumed.activeScope, "streaming");
@@ -1058,7 +1325,13 @@ describe("status.ts", () => {
   it("caps visible status lines and reports overflow consistently", () => {
     const waitingState = observeStatus(
       createStatusState({ source: "pi", startTimeMs: 0 }),
-      { snapshot: "present", updatedAt: 180_000, sequence: 1, phase: "waiting", waitingSince: 180_000 },
+      {
+        snapshot: "present",
+        updatedAt: 180_000,
+        sequence: 1,
+        phase: "waiting",
+        waitingSince: 180_000,
+      },
       180_000,
     );
     const activeState = observeStatus(
@@ -1092,7 +1365,8 @@ describe("status.ts", () => {
 });
 
 describe("subagent discovery", () => {
-  const testApi = (subagentsModule as any).__test__;
+  const testApi = testHelpers;
+  const testContract = "a".repeat(64);
 
   it("loads the Pi-default fallback setting from agent frontmatter", () => {
     const dir = createTestDir();
@@ -1117,24 +1391,36 @@ describe("subagent discovery", () => {
 
   it("retries a failed configured model once with Pi default", async () => {
     const controller = new AbortController();
-    const primary: any = {
+    const primary: RunningSubagent = {
       id: "primary",
       name: "fallback-agent",
       task: "do work",
       model: "anthropic/preferred",
       fallbackModel: "openai/current-model",
       abortController: controller,
+      surface: "test",
+      startTime: 0,
+      sessionFile: "test.jsonl",
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      interactive: false,
     };
-    const fallback: any = {
+    const fallback: RunningSubagent = {
       ...primary,
       id: "fallback",
       model: "openai/current-model",
       modelSource: "Pi default fallback",
       fallbackModel: undefined,
     };
-    const watched: any[] = [];
+    const watched: string[] = [];
     const results = [
-      { name: primary.name, task: primary.task, summary: "provider error", exitCode: 1, elapsed: 1, errorMessage: "402 credits" },
+      {
+        name: primary.name,
+        task: primary.task,
+        summary: "provider error",
+        exitCode: 1,
+        elapsed: 1,
+        errorMessage: "402 credits",
+      },
       { name: fallback.name, task: fallback.task, summary: "completed", exitCode: 0, elapsed: 2 },
     ];
 
@@ -1145,9 +1431,11 @@ describe("subagent discovery", () => {
         assert.equal(model, "openai/current-model");
         return fallback;
       },
-      async (running: any) => {
+      async (running: RunningSubagent) => {
         watched.push(running.id);
-        return results.shift();
+        const result = results.shift();
+        assert.ok(result);
+        return result;
       },
     );
 
@@ -1156,16 +1444,61 @@ describe("subagent discovery", () => {
     assert.match(result.summary, /retried with Pi default openai\/current-model/);
   });
 
+  it("clears stale exit and shutdown signals before resuming a subagent", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "session.jsonl");
+      for (const suffix of [".exit", ".process-exit", ".shutdown-request"]) {
+        writeFileSync(`${sessionFile}${suffix}`, "stale");
+      }
+      testApi.clearSubagentExitSignals(sessionFile);
+      for (const suffix of [".exit", ".process-exit", ".shutdown-request"]) {
+        assert.equal(existsSync(`${sessionFile}${suffix}`), false);
+      }
+    });
+  });
+
+  it("does not retry shutdown-timeout failures with the configured model fallback", async () => {
+    const controller = new AbortController();
+    const running: RunningSubagent = {
+      id: "timed-out",
+      name: "fallback-agent",
+      task: "do work",
+      model: "anthropic/preferred",
+      fallbackModel: "openai/current-model",
+      abortController: controller,
+      surface: "test",
+      startTime: 0,
+      sessionFile: "test.jsonl",
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      interactive: false,
+    };
+    let retryCalled = false;
+    const result = await testApi.watchSubagentWithFallback(
+      running,
+      controller.signal,
+      async () => {
+        retryCalled = true;
+        throw new Error("timeout must not trigger model fallback");
+      },
+      async () => ({
+        name: running.name,
+        task: running.task,
+        summary: "Subagent shutdown timed out",
+        exitCode: 124,
+        elapsed: 10,
+        error: "shutdown-timeout",
+      }),
+    );
+    assert.equal(retryCalled, false);
+    assert.equal(result.error, "shutdown-timeout");
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "lineage-mode-test-agent",
-        [
-          "name: lineage-mode-test-agent",
-          "model: anthropic/test-lineage",
-          "session-mode: lineage-only",
-        ].join("\n"),
+        ["name: lineage-mode-test-agent", "model: anthropic/test-lineage", "session-mode: lineage-only"].join("\n"),
       );
 
       const loaded = testApi.loadAgentDefaults("lineage-mode-test-agent");
@@ -1179,20 +1512,14 @@ describe("subagent discovery", () => {
       writeAgentFile(
         projectAgentsDir,
         "interactive-true-test-agent",
-        [
-          "name: interactive-true-test-agent",
-          "model: anthropic/test-interactive-true",
-          "interactive: true",
-        ].join("\n"),
+        ["name: interactive-true-test-agent", "model: anthropic/test-interactive-true", "interactive: true"].join("\n"),
       );
       writeAgentFile(
         projectAgentsDir,
         "interactive-false-test-agent",
-        [
-          "name: interactive-false-test-agent",
-          "model: anthropic/test-interactive-false",
-          "interactive: false",
-        ].join("\n"),
+        ["name: interactive-false-test-agent", "model: anthropic/test-interactive-false", "interactive: false"].join(
+          "\n",
+        ),
       );
 
       const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
@@ -1208,10 +1535,7 @@ describe("subagent discovery", () => {
       writeAgentFile(
         projectAgentsDir,
         "interactive-unset-test-agent",
-        [
-          "name: interactive-unset-test-agent",
-          "model: anthropic/test-interactive-unset",
-        ].join("\n"),
+        ["name: interactive-unset-test-agent", "model: anthropic/test-interactive-unset"].join("\n"),
       );
 
       const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
@@ -1221,41 +1545,23 @@ describe("subagent discovery", () => {
 
   it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
     // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
-      false,
-    );
+    assert.equal(testApi.resolveEffectiveInteractive({ agent: "A", name: "A", task: "T" }, { autoExit: true }), false);
     // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
-      true,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
-      true,
-    );
+    assert.equal(testApi.resolveEffectiveInteractive({ agent: "A", name: "A", task: "T" }, { autoExit: false }), true);
+    assert.equal(testApi.resolveEffectiveInteractive({ agent: "A", name: "A", task: "T" }, {}), true);
     // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
-      true,
-    );
+    assert.equal(testApi.resolveEffectiveInteractive({ agent: "A", name: "A", task: "T" }, null), true);
   });
 
   it("resolveEffectiveInteractive honors explicit frontmatter over the auto-exit default", () => {
     // Autonomous agent that still wants to be treated as interactive.
     assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T" },
-        { autoExit: true, interactive: true },
-      ),
+      testApi.resolveEffectiveInteractive({ agent: "A", name: "A", task: "T" }, { autoExit: true, interactive: true }),
       true,
     );
     // Non-auto-exit agent that opts back into stall pings.
     assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T" },
-        { interactive: false },
-      ),
+      testApi.resolveEffectiveInteractive({ agent: "A", name: "A", task: "T" }, { interactive: false }),
       false,
     );
   });
@@ -1266,7 +1572,7 @@ describe("subagent discovery", () => {
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(defs.fallbackModel, "pi-default", `${name} should retry with the Pi default model`);
       assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+        testApi.resolveEffectiveInteractive({ agent: name, name, task: "" }, defs),
         false,
         `${name} should resolve as non-interactive (autonomous, auto-exit)`,
       );
@@ -1280,7 +1586,8 @@ describe("subagent discovery", () => {
 
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
-    const tools = new Set(allowlist!.split(","));
+    assert.ok(allowlist);
+    const tools = new Set(allowlist.split(","));
     for (const t of ["subagent", "subagent_message", "subagents_list"]) {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
@@ -1306,16 +1613,39 @@ describe("subagent discovery", () => {
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
 
+  it("opts MCP selectors into an explicit loadout", () => {
+    const parsed = testApi.parseAgentDefinition(
+      "---\nname: mcp-agent\ntools: read,mcp:context-mode\n---\n",
+      "mcp-agent",
+    );
+    assert.equal(parsed?.explicitLoadout, true);
+  });
+
+  it("loads subagent-only extension paths from frontmatter", () => {
+    const dir = createTestDir();
+    const agentsDir = join(dir, ".pi", "agents");
+    writeAgentFile(
+      agentsDir,
+      "child-extension-agent",
+      ["name: child-extension-agent", "subagentOnlyExtensions:", "  - ./tools/fast-search.ts"].join("\n"),
+    );
+    try {
+      const agent = testApi
+        .discoverAgentDefinitions(dir)
+        .find((candidate) => candidate.name === "child-extension-agent");
+      assert.deepEqual(agent?.subagentOnlyExtensions, ["./tools/fast-search.ts"]);
+      assert.equal(agent?.explicitLoadout, false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "invalid-mode-test-agent",
-        [
-          "name: invalid-mode-test-agent",
-          "model: anthropic/test-invalid",
-          "session-mode: sideways",
-        ].join("\n"),
+        ["name: invalid-mode-test-agent", "model: anthropic/test-invalid", "session-mode: sideways"].join("\n"),
       );
 
       const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
@@ -1325,26 +1655,26 @@ describe("subagent discovery", () => {
   });
 
   it("resolves session mode from frontmatter (standalone default)", () => {
-    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
+    assert.equal(testApi.resolveEffectiveSessionMode({ agent: "A", name: "A", task: "T" }, null), "standalone");
     assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      testApi.resolveEffectiveSessionMode({ agent: "A", name: "A", task: "T" }, { sessionMode: "lineage-only" }),
       "lineage-only",
     );
     assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "fork" }),
+      testApi.resolveEffectiveSessionMode({ agent: "A", name: "A", task: "T" }, { sessionMode: "fork" }),
       "fork",
     );
   });
 
   it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
-    assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
+    assert.deepEqual(testApi.resolveLaunchBehavior({ agent: "A", name: "A", task: "T" }, null), {
       sessionMode: "standalone",
       seededSessionMode: null,
       inheritsConversationContext: false,
       taskDelivery: "artifact",
     });
     assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      testApi.resolveLaunchBehavior({ agent: "A", name: "A", task: "T" }, { sessionMode: "lineage-only" }),
       {
         sessionMode: "lineage-only",
         seededSessionMode: "lineage-only",
@@ -1352,27 +1682,1178 @@ describe("subagent discovery", () => {
         taskDelivery: "artifact",
       },
     );
-    assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "fork" }),
-      {
-        sessionMode: "fork",
-        seededSessionMode: "fork",
-        inheritsConversationContext: true,
-        taskDelivery: "direct",
-      },
-    );
+    assert.deepEqual(testApi.resolveLaunchBehavior({ agent: "A", name: "A", task: "T" }, { sessionMode: "fork" }), {
+      sessionMode: "fork",
+      seededSessionMode: "fork",
+      inheritsConversationContext: true,
+      taskDelivery: "direct",
+    });
   });
 
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
-    assert.equal(
-      testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,ask_question",
-    );
+    assert.equal(testApi.buildSubagentToolAllowlist("read,bash,web_search"), "read,bash,web_search,ask_question");
   });
 
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  });
+
+  it("resolves an explicit codemode loadout with exact provider-bound grants", () => {
+    const resolved = resolveExplicitLoadout(
+      {
+        extensions: ["builtin:codemode"],
+        mcpServers: [],
+        tools: ["read", "codemode"],
+      },
+      [{ name: "builtin:codemode", path: "builtin:codemode" }],
+      [
+        { name: "read", provider: "builtin:read", contractFingerprint: testContract },
+        { name: "codemode", provider: "builtin:codemode", contractFingerprint: testContract },
+      ],
+    );
+
+    assert.deepEqual(resolved, {
+      extensions: [{ name: "builtin:codemode", path: "builtin:codemode", identity: "builtin:codemode" }],
+      subagentOnlyExtensions: [],
+      mcpServers: [],
+      mcpServerFingerprints: [],
+      toolProviders: [
+        { name: "read", provider: "builtin:read", contractFingerprint: testContract },
+        { name: "codemode", provider: "builtin:codemode", contractFingerprint: testContract },
+      ],
+    });
+  });
+
+  it("requires tools to come from a selected resource", () => {
+    assert.throws(
+      () =>
+        resolveExplicitLoadout(
+          { extensions: ["builtin:codemode"], mcpServers: [], tools: ["web_search"] },
+          [{ name: "builtin:codemode", path: "builtin:codemode" }],
+          [
+            {
+              name: "web_search",
+              provider: "/extensions/web-search.ts",
+              contractFingerprint: testContract,
+            },
+          ],
+        ),
+      /not provided by an explicitly selected resource/,
+    );
+  });
+
+  it("grants an exact MCP tool only from its selected server", () => {
+    const fingerprint = "a".repeat(64);
+    const available = [
+      {
+        name: "mcp__selected__read",
+        provider: "builtin:mcp",
+        mcpServer: "selected",
+        contractFingerprint: testContract,
+      },
+      {
+        name: "mcp__other__read",
+        provider: "builtin:mcp",
+        mcpServer: "other",
+        contractFingerprint: testContract,
+      },
+    ];
+    const resolved = resolveExplicitLoadout(
+      { extensions: [], mcpServers: ["selected"], tools: ["mcp__selected__read"] },
+      [],
+      available,
+      [{ name: "selected", fingerprint }],
+    );
+
+    assert.deepEqual(resolved, {
+      extensions: [],
+      subagentOnlyExtensions: [],
+      mcpServers: ["selected"],
+      mcpServerFingerprints: [{ name: "selected", fingerprint }],
+      toolProviders: [available[0]],
+    });
+    assert.throws(
+      () =>
+        resolveExplicitLoadout(
+          { extensions: [], mcpServers: ["selected"], tools: ["mcp__other__read"] },
+          [],
+          available,
+          [{ name: "selected", fingerprint }],
+        ),
+      /not provided by an explicitly selected resource/,
+    );
+    assert.throws(
+      () =>
+        resolveExplicitLoadout(
+          { extensions: [], mcpServers: ["selected"], tools: ["mcp__selected__read"] },
+          [],
+          available,
+        ),
+      /no safe configuration identity/,
+    );
+  });
+
+  it("rejects unscoped MCP proxy and resource tools", () => {
+    for (const name of ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource", "tool_search"]) {
+      assert.throws(
+        () =>
+          resolveExplicitLoadout(
+            { extensions: [], mcpServers: ["selected"], tools: [name] },
+            [],
+            [
+              {
+                name: "mcp__selected__read",
+                provider: "builtin:mcp",
+                mcpServer: "selected",
+                contractFingerprint: testContract,
+              },
+              { name, provider: "builtin:mcp", contractFingerprint: testContract },
+            ],
+            [{ name: "selected", fingerprint: "a".repeat(64) }],
+          ),
+        /Generic MCP proxy\/search tool/,
+      );
+    }
+  });
+
+  it("validates selected MCP configuration and provider identity on resume", () => {
+    const fingerprint = "b".repeat(64);
+    const grant = {
+      name: "mcp__selected__read",
+      provider: "builtin:mcp",
+      mcpServer: "selected",
+      contractFingerprint: testContract,
+    };
+    const resolved = resolveExplicitLoadout(
+      { extensions: [], mcpServers: ["selected"], tools: [grant.name] },
+      [],
+      [grant],
+      [{ name: "selected", fingerprint }],
+    );
+    const snapshot = createExplicitLoadoutSnapshot(resolved, "1.4.0", [], []);
+    const context = {
+      runtimeVersion: "1.4.0",
+      requirePinnedContracts: true,
+      currentTools: [grant],
+      currentMcpServers: [{ name: "selected", fingerprint }],
+    };
+    assert.doesNotThrow(() => validateExplicitLoadoutSnapshot(snapshot, context));
+    assert.throws(
+      () =>
+        validateExplicitLoadoutSnapshot(snapshot, {
+          ...context,
+          currentMcpServers: [{ name: "selected", fingerprint: "c".repeat(64) }],
+        }),
+      /changed configuration identity/,
+    );
+    assert.throws(
+      () =>
+        validateExplicitLoadoutSnapshot(snapshot, {
+          ...context,
+          currentTools: [{ ...grant, mcpServer: "other" }],
+        }),
+      /changed provider or contract/,
+    );
+  });
+
+  it("snapshots exact MCP server names from Pi tool namespaces", () => {
+    const providers = snapshotToolProviders([
+      {
+        name: "mcp__selected_server__read",
+        description: "Read a value.",
+        parameters: { type: "object" },
+        sourceInfo: { path: "builtin:mcp" },
+        namespace: { aliases: ["selected-server"] },
+      },
+    ]);
+    assert.equal(providers[0].mcpServer, "selected-server");
+    assert.equal(providers[0].provider, "builtin:mcp");
+    assert.match(providers[0].contractFingerprint ?? "", /^[a-f0-9]{64}$/);
+    const ambiguous = snapshotToolProviders([
+      {
+        name: "mcp__selected_server__read",
+        description: "Read a value.",
+        parameters: { type: "object" },
+        sourceInfo: { path: "builtin:mcp" },
+        namespace: { aliases: ["selected-server", "selected_server"] },
+      },
+    ]);
+    assert.equal(ambiguous[0].mcpServer, undefined);
+    assert.throws(
+      () =>
+        resolveExplicitLoadout(
+          { extensions: [], mcpServers: [], tools: ["mcp__selected_server__read"] },
+          [],
+          ambiguous,
+        ),
+      /not provided by an explicitly selected resource/,
+    );
+
+    const foreignProvider = snapshotToolProviders([
+      {
+        name: "mcp__selected_server__read",
+        description: "Read a value.",
+        parameters: { type: "object" },
+        sourceInfo: { path: "/extensions/other.ts" },
+        namespace: { aliases: ["selected-server"] },
+      },
+    ]);
+    assert.equal(foreignProvider[0].mcpServer, undefined);
+    assert.throws(
+      () =>
+        resolveExplicitLoadout(
+          { extensions: [], mcpServers: [], tools: ["mcp__selected_server__read"] },
+          [],
+          foreignProvider,
+        ),
+      /unexpected provider identity/,
+    );
+  });
+
+  it("expands MCP server and exact-tool selectors to provider-bound names", () => {
+    const available = [
+      {
+        name: "mcp__context_mode__ctx_search",
+        provider: "builtin:mcp",
+        mcpServer: "context-mode",
+        contractFingerprint: testContract,
+      },
+      {
+        name: "mcp__context_mode__ctx_stats",
+        provider: "builtin:mcp",
+        mcpServer: "context-mode",
+        contractFingerprint: testContract,
+      },
+      {
+        name: "mcp__rea__inspect_native_instruction",
+        provider: "builtin:mcp",
+        mcpServer: "rea",
+        contractFingerprint: testContract,
+      },
+    ];
+    assert.deepEqual(
+      testApi.expandMcpToolSelectors(["read", "mcp:context-mode", "mcp:rea/inspect_native_instruction"], available),
+      {
+        tools: [
+          "read",
+          "mcp__context_mode__ctx_search",
+          "mcp__context_mode__ctx_stats",
+          "mcp__rea__inspect_native_instruction",
+        ],
+        servers: ["context-mode", "rea"],
+      },
+    );
+    assert.throws(() => testApi.expandMcpToolSelectors(["mcp:missing"], available), /not available/);
+  });
+
+  it("creates exact grants for tools supplied only by selected child extensions", () => {
+    withTempDir((dir) => {
+      const extensionPath = join(dir, "web-access.ts");
+      writeFileSync(extensionPath, "export default function webAccess() {}\\n");
+      const childExtension = { path: extensionPath, fingerprint: fingerprintExtension(extensionPath) };
+      const resolved = resolveExplicitLoadout(
+        { extensions: [], mcpServers: [], subagentOnlyExtensions: [childExtension], tools: ["web_search"] },
+        [],
+        [],
+      );
+      assert.deepEqual(resolved.subagentOnlyExtensions, [childExtension]);
+      assert.deepEqual(resolved.toolProviders, [
+        { name: "web_search", provider: "subagent-only-extension", runnerManaged: true },
+      ]);
+      const snapshot = createExplicitLoadoutSnapshot(resolved, "1.4.0", [], []);
+      validateExplicitLoadoutSnapshot(snapshot, { runtimeVersion: "1.4.0" });
+      writeFileSync(extensionPath, "export default function changedWebAccess() {}\\n");
+      assert.throws(
+        () => validateExplicitLoadoutSnapshot(snapshot, { runtimeVersion: "1.4.0" }),
+        /Subagent-only extension changed/,
+      );
+    });
+  });
+
+  it("pins child built-ins missing from a restricted parent's tool registry", () => {
+    withTempDir((dir) => {
+      const extensionPath = join(dir, "child-tools.ts");
+      writeFileSync(extensionPath, "export default function childTools() {}\n");
+      const childExtension = { path: extensionPath, fingerprint: fingerprintExtension(extensionPath) };
+      for (const subagentOnlyExtensions of [[], [childExtension]]) {
+        const names = ["grep", "find", "ls"];
+        const resolved = resolveExplicitLoadout({ tools: names, subagentOnlyExtensions }, [], []);
+        assert.deepEqual(
+          resolved.toolProviders,
+          names.map((name) => ({ name, provider: `builtin:${name}`, runnerManaged: true })),
+        );
+        const providers = snapshotToolProviders(
+          names.map((name) => ({
+            name,
+            description: `${name} tool`,
+            parameters: {},
+            sourceInfo: { path: `builtin:${name}` },
+          })),
+        );
+        let pinned: unknown;
+        const handlers = createToolPolicyHandlers(
+          resolved.toolProviders,
+          () => providers,
+          (grants) => {
+            pinned = grants;
+          },
+        );
+        assert.equal(
+          handlers.start({
+            shutdown() {
+              assert.fail("valid built-ins must not stop startup");
+            },
+          }),
+          undefined,
+        );
+        assert.deepEqual(
+          pinned,
+          providers.map((provider) => ({ ...provider, runnerManaged: true })),
+        );
+        assert.deepEqual(handlers.handleInput(), { action: "continue" });
+        for (const name of names) assert.equal(handlers.authorize({ toolName: name }), undefined);
+
+        for (const invalidProviders of [[], providers.map((provider) => ({ ...provider, provider: extensionPath }))]) {
+          let stopped = false;
+          const invalid = createToolPolicyHandlers(resolved.toolProviders, () => invalidProviders);
+          assert.match(
+            invalid.start({
+              shutdown() {
+                stopped = true;
+              },
+            }) ?? "",
+            /unexpected provider or contract/,
+          );
+          assert.equal(stopped, true, "absent or substituted built-ins must fail closed");
+        }
+      }
+      assert.throws(() => resolveExplicitLoadout({ tools: ["unknown_tool"] }, [], []), /not available/);
+    });
+  });
+
+  it("fingerprints safe MCP configuration without persisting secret values", () => {
+    const first = fingerprintMcpServerConfig("selected", {
+      command: "node",
+      args: ["server.mjs", "--mode", "safe"],
+      env: { API_TOKEN: "first-secret" },
+      exposure: "direct",
+    });
+    const rotatedCredential = fingerprintMcpServerConfig("selected", {
+      command: "node",
+      args: ["server.mjs", "--mode", "safe"],
+      env: { API_TOKEN: "second-secret" },
+      exposure: "direct",
+    });
+    const changedConfig = fingerprintMcpServerConfig("selected", {
+      command: "node",
+      args: ["server.mjs", "--mode", "restricted"],
+      env: { API_TOKEN: "second-secret" },
+      exposure: "direct",
+    });
+    const changedWorkingDirectory = fingerprintMcpServerConfig(
+      "selected",
+      {
+        command: "node",
+        args: ["server.mjs", "--mode", "safe"],
+        env: { API_TOKEN: "first-secret" },
+        exposure: "direct",
+      },
+      "/tmp/another-project",
+    );
+    assert.equal(first, rotatedCredential, "secret values are excluded from the safe configuration identity");
+    assert.notEqual(first, changedConfig, "non-secret server arguments are pinned");
+    assert.notEqual(first, changedWorkingDirectory, "the effective stdio working directory is pinned");
+    const filesystemPath = "/Users/someone/Documents/work/client-projects";
+    const filesystemIdentity = fingerprintMcpServerConfig("filesystem", {
+      command: "node",
+      args: ["server.mjs", filesystemPath],
+    });
+    const otherFilesystemIdentity = fingerprintMcpServerConfig("filesystem", {
+      command: "node",
+      args: ["server.mjs", "/Users/someone/Documents/work/other-project"],
+    });
+    assert.notEqual(filesystemIdentity, otherFilesystemIdentity, "filesystem paths are safely pinned");
+    assert.match(first, /^[a-f0-9]{64}$/);
+    assert.doesNotMatch(first, /first-secret|second-secret/);
+    assert.throws(
+      () => fingerprintMcpServerConfig("selected", { command: "node", args: ["--api-key", "secret"] }),
+      /secret-like arguments/,
+    );
+    assert.throws(
+      () => fingerprintMcpServerConfig("selected", { command: "node", args: ["x".repeat(48)] }),
+      /secret-like arguments/,
+    );
+    assert.throws(
+      () => fingerprintMcpServerConfig("selected", { command: "node", futureRuntimeOption: true }),
+      /fields that cannot be safely fingerprinted/,
+    );
+  });
+
+  it("rejects ambiguous MCP config sources instead of guessing the effective server", () => {
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const cwd = join(dir, "project");
+      mkdirSync(join(cwd, ".pi"), { recursive: true });
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: { selected: { command: "node" } } }));
+      writeFileSync(join(cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { selected: { command: "node" } } }));
+      assert.throws(
+        () => resolveMcpServerIdentities(["selected"], { agentDir, cwd }),
+        /ambiguous configuration sources/,
+      );
+    });
+  });
+
+  it("appends the built-in MCP runtime only for explicit MCP server selections", () => {
+    const mcpParts: string[] = [];
+    appendExplicitLoadoutArgs(
+      mcpParts,
+      {
+        version: 1,
+        runtimeVersion: "1.4.0",
+        extensions: [],
+        mcpServers: ["selected"],
+        toolProviders: [],
+        runnerFiles: [],
+      },
+      "mcp__selected__read",
+      "/policy.ts",
+      shellEscape,
+    );
+    assert.ok(mcpParts.includes("-e"));
+    assert.ok(mcpParts.includes("'builtin:mcp'"));
+    assert.equal(mcpParts.includes("--no-mcp"), false);
+
+    const noMcpParts: string[] = [];
+    appendExplicitLoadoutArgs(
+      noMcpParts,
+      { version: 1, runtimeVersion: "1.4.0", extensions: [], mcpServers: [], toolProviders: [], runnerFiles: [] },
+      "read",
+      "/policy.ts",
+      shellEscape,
+    );
+    assert.ok(noMcpParts.includes("--no-mcp"));
+  });
+
+  it("registers exact subagent extension names with a stable identity", () => {
+    withTempDir((dir) => {
+      const path = join(dir, "extension.ts");
+      writeFileSync(path, "export default () => undefined;", "utf8");
+      const name = `test-resource-${Date.now()}`;
+      assert.throws(() => testApi.registerSubagentExtension(`${name}-missing-identity`, path, ""), /Invalid identity/);
+      assert.doesNotThrow(() => testApi.registerSubagentExtension(name, path, "test-resource@1"));
+      assert.doesNotThrow(() => testApi.registerSubagentExtension(name, path, "test-resource@1"));
+      assert.throws(() => testApi.registerSubagentExtension(name, path, "test-resource@2"), /already registered/);
+    });
+  });
+
+  it("publishes a fresh durable process-exit sidecar for successful and failed legacy launches", () => {
+    withTempDir((dir) => {
+      const exitPath = join(dir, "session.process-exit");
+      writeFileSync(exitPath, "stale completion");
+      const command = buildProcessExitCommand("exit 7", exitPath, shellEscape);
+      const result = spawnSync("bash", ["-c", command], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0);
+      assert.deepEqual(JSON.parse(readFileSync(exitPath, "utf8")), { type: "process_exit", exitCode: 7 });
+
+      const successful = buildProcessExitCommand("exit 0", exitPath, shellEscape);
+      const successResult = spawnSync("bash", ["-c", successful], { encoding: "utf8", timeout: 5000 });
+      assert.equal(successResult.status, 0);
+      assert.deepEqual(JSON.parse(readFileSync(exitPath, "utf8")), { type: "process_exit", exitCode: 0 });
+    });
+  });
+
+  it("preserves a normal explicit child nonzero exit code in its process-exit sidecar", () => {
+    withTempDir((dir) => {
+      const readyPath = join(dir, "ready");
+      const exitPath = join(dir, "session.exit");
+      const processExitPath = join(dir, "session.process-exit");
+      const command = buildStartupDeadlineCommand({
+        command: `printf ready > ${shellEscape(readyPath)}; exit 9`,
+        readyFile: readyPath,
+        exitFile: exitPath,
+        processExitFile: processExitPath,
+        shutdownRequestFile: join(dir, "session.shutdown-request"),
+        timeoutMs: 1000,
+        escape: shellEscape,
+      });
+      const result = spawnSync("bash", ["-c", command], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(readFileSync(processExitPath, "utf8")), { type: "process_exit", exitCode: 9 });
+    });
+  });
+
+  it("terminates an explicit child that does not signal startup readiness by its deadline", () => {
+    withTempDir((dir) => {
+      const readyPath = join(dir, "ready");
+      const exitPath = join(dir, "session.exit");
+      const processExitPath = join(dir, "session.process-exit");
+      const command = buildStartupDeadlineCommand({
+        command: "exec sleep 5",
+        readyFile: readyPath,
+        exitFile: exitPath,
+        processExitFile: processExitPath,
+        shutdownRequestFile: join(dir, "session.shutdown-request"),
+        timeoutMs: 100,
+        escape: shellEscape,
+      });
+      const result = spawnSync("bash", ["-c", command], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(readFileSync(exitPath, "utf8")), {
+        type: "error",
+        errorMessage: "Explicit subagent startup timed out before loadout readiness.",
+      });
+      assert.deepEqual(JSON.parse(readFileSync(processExitPath, "utf8")), { type: "process_exit", exitCode: 143 });
+    });
+  });
+
+  it("preserves a child's loadout failure instead of replacing it with a startup timeout", () => {
+    withTempDir((dir) => {
+      const readyPath = join(dir, "ready");
+      const exitPath = join(dir, "session.exit");
+      const childError = { type: "error", errorMessage: 'Granted tool \\"ffgrep\\" is unavailable.' };
+      const command = buildStartupDeadlineCommand({
+        command: `printf '%s' ${shellEscape(JSON.stringify(childError))} > ${shellEscape(exitPath)}; exec sleep 5`,
+        readyFile: readyPath,
+        exitFile: exitPath,
+        processExitFile: join(dir, "session.process-exit"),
+        shutdownRequestFile: join(dir, "session.shutdown-request"),
+        timeoutMs: 500,
+        escape: shellEscape,
+      });
+      const result = spawnSync("bash", ["-c", command], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.error, undefined);
+      assert.deepEqual(JSON.parse(readFileSync(exitPath, "utf8")), childError);
+    });
+  });
+
+  it("stops waiting once an explicit child signals startup readiness", () => {
+    withTempDir((dir) => {
+      const readyPath = join(dir, "ready");
+      const exitPath = join(dir, "session.exit");
+      const processExitPath = join(dir, "session.process-exit");
+      const shutdownRequestPath = join(dir, "session.shutdown-request");
+      writeFileSync(processExitPath, "stale completion");
+      writeFileSync(shutdownRequestPath, "stale request");
+      const command = buildStartupDeadlineCommand({
+        command: `printf ready > ${shellEscape(readyPath)}; exec true`,
+        readyFile: readyPath,
+        exitFile: exitPath,
+        processExitFile: processExitPath,
+        shutdownRequestFile: shutdownRequestPath,
+        timeoutMs: 1000,
+        escape: shellEscape,
+      });
+      const result = spawnSync("bash", ["-c", command], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(readFileSync(readyPath, "utf8"), "ready");
+      assert.equal(existsSync(exitPath), false);
+      assert.deepEqual(JSON.parse(readFileSync(processExitPath, "utf8")), { type: "process_exit", exitCode: 0 });
+      assert.equal(existsSync(shutdownRequestPath), false);
+    });
+  });
+
+  it("rejects registered extensions without a trusted identity", () => {
+    withTempDir((dir) => {
+      const path = join(dir, "extension.ts");
+      writeFileSync(path, "export default () => undefined;", "utf8");
+      assert.throws(
+        () =>
+          resolveExplicitLoadout(
+            { extensions: ["untrusted-extension"], tools: [] },
+            [{ name: "untrusted-extension", path }],
+            [],
+          ),
+        /trusted registration identity/,
+      );
+      const resolved = resolveExplicitLoadout(
+        { extensions: ["untrusted-extension"], tools: [], identity: "profile-controlled" } as Parameters<
+          typeof resolveExplicitLoadout
+        >[0],
+        [{ name: "untrusted-extension", path, identity: "trusted-registration@1" }],
+        [],
+      );
+      assert.equal(resolved.extensions[0].identity, "trusted-registration@1");
+    });
+  });
+
+  it("pins registered extension identity and entrypoint content for resume", () => {
+    withTempDir((dir) => {
+      const path = join(dir, "plugin.ts");
+      const policyPath = join(dir, "policy.ts");
+      writeFileSync(path, "export default () => 1;", "utf8");
+      writeFileSync(policyPath, "export const policy = 1;", "utf8");
+      const resolved = resolveExplicitLoadout(
+        { extensions: ["sample-extension"], tools: ["sample_tool"] },
+        [{ name: "sample-extension", path, identity: "sample-extension@1.2.3" }],
+        [{ name: "sample_tool", provider: path, contractFingerprint: testContract }],
+      );
+      assert.equal(resolved.extensions[0].fingerprint?.length, 64);
+      const snapshot = {
+        version: 1,
+        runtimeVersion: "1.4.0",
+        extensions: resolved.extensions,
+        mcpServers: [],
+        toolProviders: resolved.toolProviders,
+        runnerFiles: [{ path: policyPath, fingerprint: fingerprintExtension(policyPath) }],
+      };
+      const registered = [{ name: "sample-extension", path, identity: "sample-extension@1.2.3" }];
+      assert.doesNotThrow(() =>
+        validateExplicitLoadoutSnapshot(snapshot, {
+          runtimeVersion: "1.4.0",
+          registeredExtensions: registered,
+          requirePinnedContracts: true,
+          currentTools: resolved.toolProviders,
+        }),
+      );
+      assert.throws(
+        () =>
+          validateExplicitLoadoutSnapshot(snapshot, {
+            runtimeVersion: "1.4.0",
+            registeredExtensions: [{ name: "sample-extension", path, identity: "sample-extension@1.2.4" }],
+          }),
+        /changed identity/,
+      );
+      assert.throws(
+        () =>
+          validateExplicitLoadoutSnapshot(
+            {
+              ...snapshot,
+              extensions: [
+                {
+                  name: "sample-extension",
+                  path,
+                  identity: "",
+                  fingerprint: resolved.extensions[0].fingerprint,
+                },
+              ],
+            },
+            { runtimeVersion: "1.4.0", registeredExtensions: registered },
+          ),
+        /no trusted registration identity/,
+      );
+      assert.throws(
+        () =>
+          validateExplicitLoadoutSnapshot(snapshot, {
+            runtimeVersion: "1.4.0",
+            registeredExtensions: registered,
+            requirePinnedContracts: true,
+            currentTools: [{ name: "sample_tool", provider: path, contractFingerprint: "changed" }],
+          }),
+        /changed provider or contract/,
+      );
+      assert.throws(
+        () =>
+          validateExplicitLoadoutSnapshot(snapshot, {
+            runtimeVersion: "1.4.0",
+            registeredExtensions: registered,
+            requirePinnedContracts: true,
+            currentTools: [
+              { name: "sample_tool", provider: "/extensions/replaced.ts", contractFingerprint: testContract },
+            ],
+          }),
+        /changed provider or contract/,
+      );
+      writeFileSync(policyPath, "export const policy = 2;", "utf8");
+      assert.throws(
+        () => validateExplicitLoadoutSnapshot(snapshot, { runtimeVersion: "1.4.0" }),
+        /policy code changed/,
+      );
+      writeFileSync(path, "export default () => 2;", "utf8");
+      assert.throws(
+        () =>
+          validateExplicitLoadoutSnapshot(snapshot, {
+            runtimeVersion: "1.4.0",
+            registeredExtensions: [{ name: "sample-extension", path, identity: "sample-extension@1.2.3" }],
+          }),
+        /changed/,
+      );
+    });
+  });
+
+  it("treats an empty extension list as explicit strict mode", () => {
+    const resolved = resolveExplicitLoadout(
+      { extensions: [], mcpServers: [], tools: ["read"] },
+      [],
+      [{ name: "read", provider: "builtin:read", contractFingerprint: testContract }],
+    );
+    assert.equal(resolved.extensions.length, 0);
+  });
+
+  it("rejects wildcard grants and duplicate provider identities", () => {
+    assert.throws(
+      () =>
+        resolveExplicitLoadout(
+          { extensions: [], mcpServers: [], tools: ["mcp__*"] },
+          [],
+          [{ name: "mcp__ctx_search", provider: "builtin:mcp" }],
+        ),
+      /Exact tool names are required/,
+    );
+    assert.throws(
+      () =>
+        validateToolProviderGrants(
+          [{ name: "read", provider: "builtin:read" }],
+          [
+            { name: "read", provider: "builtin:read" },
+            { name: "read", provider: "builtin:read-shadow" },
+          ],
+        ),
+      /ambiguous/,
+    );
+  });
+
+  it("authorizes direct and nested calls only for the exact pinned provider", () => {
+    const grants = [
+      {
+        name: "web_search",
+        provider: "/extensions/web-search.ts",
+        contractFingerprint: testContract,
+      },
+    ];
+    const providers = [
+      {
+        name: "web_search",
+        provider: "/extensions/web-search.ts",
+        contractFingerprint: testContract,
+      },
+    ];
+    assert.deepEqual(authorizeToolCall("web_search", grants, providers), { allowed: true });
+    const notGranted = authorizeToolCall("web_fetch", grants, providers);
+    assert.equal(notGranted.allowed, false);
+    if (notGranted.allowed) throw new Error("expected denied call");
+    assert.match(notGranted.reason, /not granted/);
+    assert.match(
+      deniedToolCallReason(
+        authorizeToolCall("web_search", grants, [
+          { name: "web_search", provider: "/extensions/other.ts", contractFingerprint: testContract },
+        ]),
+      ),
+      /provider or contract changed/,
+    );
+    assert.match(
+      deniedToolCallReason(
+        authorizeToolCall("web_search", grants, [
+          {
+            name: "web_search",
+            provider: "/extensions/web-search.ts",
+            contractFingerprint: "changed",
+          },
+        ]),
+      ),
+      /provider or contract changed/,
+    );
+    assert.match(
+      deniedToolCallReason(
+        authorizeToolCall("web_search", grants, [
+          ...providers,
+          { name: "web_search", provider: "/extensions/duplicate.ts", contractFingerprint: testContract },
+        ]),
+      ),
+      /provider or contract changed/,
+    );
+  });
+
+  it("enforces the same exact provider policy for direct and nested tool calls", () => {
+    let providers = [{ name: "read", provider: "builtin:read", contractFingerprint: testContract }];
+    const policy = createToolPolicyHandlers(
+      [{ name: "read", provider: "builtin:read", contractFingerprint: testContract }],
+      () => providers,
+    );
+    assert.equal(policy.authorize({ toolName: "read" })?.block, true);
+    policy.start({
+      shutdown() {
+        assert.fail("valid provider setup should not shut down");
+      },
+    });
+    assert.deepEqual(policy.handleInput(), { action: "continue" });
+    assert.equal(policy.authorize({ toolName: "read" })?.block, undefined);
+    assert.equal(policy.authorize({ toolName: "write", parentToolCallId: "codemode/1" })?.block, true);
+    providers = [{ name: "read", provider: "builtin:read-shadow", contractFingerprint: testContract }];
+    assert.equal(policy.authorize({ toolName: "read", parentToolCallId: "codemode/2" })?.block, true);
+  });
+
+  it("binds explicitly granted child-only extension tools to their loaded provider", () => {
+    const extensionPath = "/child/extensions/web-access.ts";
+    const actual = { name: "web_search", provider: extensionPath, contractFingerprint: testContract };
+    let pinned: readonly ResolvedToolProvider[] = [];
+    const policy = createToolPolicyHandlers(
+      [{ name: "web_search", provider: "subagent-only-extension", runnerManaged: true }],
+      () => [actual],
+      (grants) => {
+        pinned = grants;
+      },
+      undefined,
+      undefined,
+      undefined,
+      [extensionPath],
+    );
+    const error = policy.start({
+      shutdown() {
+        assert.fail("selected child extension should be accepted");
+      },
+    });
+    assert.equal(error, undefined);
+    assert.equal(pinned[0]?.provider, extensionPath);
+    assert.equal(pinned[0]?.contractFingerprint, testContract);
+    assert.deepEqual(policy.handleInput(), { action: "continue" });
+    assert.equal(policy.authorize({ toolName: "web_search" }), undefined);
+  });
+
+  it("defers child-only extension readiness until before_agent_start", async () => {
+    const extensionPath = "/child/extensions/context-mode.js";
+    const grant = { name: "ctx_execute", provider: CHILD_ONLY_EXTENSION_PROVIDER, runnerManaged: true };
+    let providers: ResolvedToolProvider[] = [];
+    let pinned: readonly ResolvedToolProvider[] = [];
+    let validatedSignals = 0;
+    let readinessSignals = 0;
+    const previousDeadline = process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+    process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = String(Date.now() + 5_000);
+    try {
+      const policy = createToolPolicyHandlers(
+        [grant],
+        () => providers,
+        (grants) => {
+          pinned = grants;
+        },
+        () => readinessSignals++,
+        () => validatedSignals++,
+        undefined,
+        [extensionPath],
+      );
+
+      assert.equal(policy.start({ shutdown: () => assert.fail("child-only provider may register later") }), undefined);
+      assert.equal(validatedSignals, 0);
+      assert.deepEqual(policy.handleInput(), { action: "continue" });
+      assert.equal(policy.authorize({ toolName: grant.name })?.block, true);
+
+      providers = [{ name: grant.name, provider: extensionPath, contractFingerprint: testContract }];
+      assert.equal(
+        await policy.beforeAgentStart({ shutdown: () => assert.fail("provider should validate") }),
+        undefined,
+      );
+      assert.equal(pinned[0]?.provider, extensionPath);
+      assert.equal(pinned[0]?.contractFingerprint, testContract);
+      assert.equal(validatedSignals, 1);
+      assert.equal(readinessSignals, 1);
+      assert.equal(policy.authorize({ toolName: grant.name }), undefined);
+    } finally {
+      if (previousDeadline === undefined) delete process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+      else process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = previousDeadline;
+    }
+  });
+
+  it("defers pinned child-only extension tools on resume until before_agent_start", async () => {
+    const extensionPath = "/child/extensions/context-mode.js";
+    const grant = { name: "ctx_execute", provider: extensionPath, contractFingerprint: testContract };
+    let providers: ResolvedToolProvider[] = [];
+    const policy = createToolPolicyHandlers([grant], () => providers, undefined, undefined, undefined, undefined, [
+      extensionPath,
+    ]);
+    const previousDeadline = process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+    process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = String(Date.now() + 5_000);
+    try {
+      assert.equal(policy.start({ shutdown: () => assert.fail("child-only tool should be awaited") }), undefined);
+      assert.deepEqual(policy.handleInput(), { action: "continue" });
+
+      providers = [{ ...grant }];
+      assert.equal(
+        await policy.beforeAgentStart({ shutdown: () => assert.fail("pinned provider should validate") }),
+        undefined,
+      );
+      assert.equal(policy.authorize({ toolName: grant.name }), undefined);
+    } finally {
+      if (previousDeadline === undefined) delete process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+      else process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = previousDeadline;
+    }
+  });
+
+  it("signals readiness only when the validated initial input is allowed", () => {
+    const provider = { name: "read", provider: "builtin:read", contractFingerprint: testContract };
+    let readinessSignals = 0;
+    const policy = createToolPolicyHandlers(
+      [provider],
+      () => [provider],
+      undefined,
+      () => {
+        readinessSignals++;
+      },
+    );
+    assert.deepEqual(policy.handleInput(), { action: "handled" });
+    policy.start({
+      shutdown() {
+        assert.fail("valid provider setup should not shut down");
+      },
+    });
+    assert.equal(readinessSignals, 0);
+    assert.equal(policy.authorize({ toolName: "read" })?.block, true);
+    assert.deepEqual(policy.handleInput(), { action: "continue" });
+    assert.equal(readinessSignals, 1);
+    assert.equal(policy.authorize({ toolName: "read" })?.block, undefined);
+
+    const invalid = createToolPolicyHandlers([{ ...provider, contractFingerprint: "changed" }], () => [provider]);
+    invalid.start({ shutdown() {} });
+    assert.deepEqual(invalid.handleInput(), { action: "handled" });
+
+    let currentProviders = [provider];
+    let shutdownCount = 0;
+    const drifted = createToolPolicyHandlers(
+      [provider],
+      () => currentProviders,
+      undefined,
+      () => {
+        readinessSignals++;
+      },
+    );
+    drifted.start({
+      shutdown() {
+        shutdownCount++;
+      },
+    });
+    currentProviders = [{ ...provider, contractFingerprint: "changed" }];
+    assert.deepEqual(
+      drifted.handleInput({
+        shutdown() {
+          shutdownCount++;
+        },
+      }),
+      { action: "handled" },
+    );
+    assert.equal(shutdownCount, 1, "provider drift must shut down the child before the model request");
+    assert.equal(readinessSignals, 1, "provider drift must not signal readiness");
+  });
+
+  it("defers MCP grant readiness until direct server tools are available", async () => {
+    const grant = {
+      name: "mcp__selected__read",
+      provider: "builtin:mcp",
+      mcpServer: "selected",
+      contractFingerprint: testContract,
+    };
+    let providers: (typeof grant)[] = [];
+    let readinessSignals = 0;
+    const policy = createToolPolicyHandlers(
+      [grant],
+      () => providers,
+      undefined,
+      () => readinessSignals++,
+    );
+
+    const previousDeadline = process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+    process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = String(Date.now() + 5_000);
+    try {
+      policy.start({ shutdown: () => assert.fail("MCP tool startup may still be connecting") });
+      assert.deepEqual(policy.handleInput(), { action: "continue" });
+      assert.equal(policy.authorize({ toolName: grant.name })?.block, true);
+
+      const pendingReadiness = policy.beforeAgentStart();
+      providers = [grant];
+      assert.equal(await pendingReadiness, undefined);
+      assert.equal(readinessSignals, 1);
+      assert.equal(policy.authorize({ toolName: grant.name })?.block, undefined);
+
+      providers = [];
+      let shutdownCount = 0;
+      const unavailable = createToolPolicyHandlers([grant], () => providers);
+      process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = String(Date.now() + 50);
+      unavailable.start({ shutdown: () => assert.fail("MCP tool startup may still be connecting") });
+      assert.deepEqual(unavailable.handleInput(), { action: "continue" });
+      assert.match(
+        (await unavailable.beforeAgentStart({ shutdown: () => shutdownCount++ })) ?? "",
+        /Granted tool "mcp__selected__read" is unavailable/,
+      );
+      assert.equal(shutdownCount, 1);
+      assert.equal(unavailable.authorize({ toolName: grant.name })?.block, true);
+    } finally {
+      if (previousDeadline === undefined) delete process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+      else process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = previousDeadline;
+    }
+  });
+
+  it("pins runner-managed tool contracts on the first start and checks them thereafter", () => {
+    let pinned: readonly ResolvedToolProvider[] = [];
+    let providers = [
+      {
+        name: "ask_question",
+        provider: "/runner/subagent-done.ts",
+        contractFingerprint: testContract,
+      },
+    ];
+    const policy = createToolPolicyHandlers(
+      [{ name: "ask_question", provider: "/runner/subagent-done.ts", runnerManaged: true }],
+      () => providers,
+      (grants) => {
+        pinned = grants;
+      },
+    );
+    policy.start({
+      shutdown() {
+        assert.fail("runner tool contract should pin successfully");
+      },
+    });
+    assert.equal(pinned[0]?.contractFingerprint, testContract);
+    assert.deepEqual(policy.handleInput(), { action: "continue" });
+    assert.equal(policy.authorize({ toolName: "ask_question" }), undefined);
+    providers = [
+      {
+        name: "ask_question",
+        provider: "/runner/subagent-done.ts",
+        contractFingerprint: "changed",
+      },
+    ];
+    assert.equal(policy.authorize({ toolName: "ask_question" })?.block, true);
+  });
+
+  it("parses explicit resource fields and preserves an empty-list opt-in", () => {
+    const parsed = subagentsModule.__test__.parseAgentDefinition(
+      ["---", "name: strict-test", "extensions:", "mcp_servers:", "tools: read, codemode", "---", "body"].join("\n"),
+      "strict-test",
+    );
+    assert.ok(parsed);
+    assert.equal(parsed.explicitLoadout, true);
+    assert.deepEqual(parsed.extensions, []);
+    assert.deepEqual(parsed.mcpServers, []);
+    assert.equal(parsed.tools, "read, codemode");
+  });
+
+  it("normalizes tool descriptions consistently when snapshotting provider contracts", () => {
+    const common = { name: "sample_tool", sourceInfo: { path: "builtin:sample" }, parameters: {} };
+    const missingDescription = snapshotToolProviders([{ ...common }]);
+    const nonStringDescription = snapshotToolProviders([{ ...common, description: 42 }]);
+    const emptyDescription = snapshotToolProviders([{ ...common, description: "" }]);
+    assert.deepEqual(missingDescription, nonStringDescription);
+    assert.deepEqual(nonStringDescription, emptyDescription);
+    assert.equal(missingDescription[0].name, "sample_tool");
+    assert.equal(missingDescription[0].provider, "builtin:sample");
+  });
+
+  it("validates pinned runtime and extension identity before resume", () => {
+    const snapshot = {
+      version: 1,
+      runtimeVersion: "1.4.0",
+      extensions: [{ name: "builtin:codemode", path: "builtin:codemode" }],
+      mcpServers: [],
+      toolProviders: [{ name: "codemode", provider: "builtin:codemode", contractFingerprint: testContract }],
+      runnerFiles: [],
+    };
+    assert.doesNotThrow(() => validateExplicitLoadoutSnapshot(snapshot, { runtimeVersion: "1.4.0" }));
+    assert.throws(() => validateExplicitLoadoutSnapshot(snapshot, { runtimeVersion: "1.4.1" }), /runtime changed/);
+    const unresolved = {
+      ...snapshot,
+      toolProviders: [{ name: "ask_question", provider: "/runner", runnerManaged: true }],
+    };
+    assert.throws(
+      () =>
+        validateExplicitLoadoutSnapshot(unresolved, {
+          runtimeVersion: "1.4.0",
+          requirePinnedContracts: true,
+        }),
+      /not pinned/,
+    );
+    const pinnedRunnerGrant = {
+      ...snapshot,
+      toolProviders: [
+        {
+          name: "ask_question",
+          provider: "/runner",
+          contractFingerprint: testContract,
+          runnerManaged: true,
+        },
+      ],
+    };
+    assert.doesNotThrow(() =>
+      validateExplicitLoadoutSnapshot(pinnedRunnerGrant, {
+        runtimeVersion: "1.4.0",
+        requirePinnedContracts: true,
+        currentTools: [{ name: "ask_question", provider: "/changed-parent", contractFingerprint: "different" }],
+      }),
+    );
+    assert.throws(
+      () =>
+        validateExplicitLoadoutSnapshot(
+          {
+            ...pinnedRunnerGrant,
+            toolProviders: [{ name: "selected_tool", provider: "/extension", contractFingerprint: testContract }],
+          },
+          {
+            runtimeVersion: "1.4.0",
+            requirePinnedContracts: true,
+            currentTools: [{ name: "selected_tool", provider: "/changed-parent", contractFingerprint: "different" }],
+          },
+        ),
+      /changed provider or contract/,
+    );
+  });
+
+  it("applySandboxToParts replays child-only extension paths with their pinned contents", () => {
+    withTempDir((dir) => {
+      const extensionPath = join(dir, "child-search.ts");
+      writeFileSync(extensionPath, "export default function childSearch() {}\\n");
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "researcher",
+          toolAllowlist: "read,web_search,ask_question",
+          subagentOnlyExtensions: [{ path: extensionPath, fingerprint: testApi.fingerprintExtension(extensionPath) }],
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: false,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: dir, name: "researcher" },
+      );
+      assert.ok(parts.includes("--no-extensions"));
+      assert.ok(parts.includes("-e"));
+      assert.ok(parts.includes(`'${extensionPath}'`));
+    });
+  });
+
+  it("applySandboxToParts explicitly loads codemode and disables MCP in strict mode", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "worker",
+          toolAllowlist: "read,codemode,ask_question,subagent",
+          explicitLoadout: {
+            version: 1,
+            runtimeVersion: "1.4.0",
+            extensions: [{ name: "builtin:codemode", path: "builtin:codemode", identity: "builtin:codemode" }],
+            mcpServers: [],
+            toolProviders: [
+              { name: "read", provider: "builtin:read", contractFingerprint: testContract },
+              { name: "codemode", provider: "builtin:codemode", contractFingerprint: testContract },
+              { name: "subagent", provider: "/runner/index.ts", runnerManaged: true },
+            ],
+            runnerFiles: [],
+          },
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: false,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "worker", runtimeVersion: "1.4.0", registeredExtensions: [] },
+      );
+      assert.ok(parts.includes("--no-extensions"));
+      assert.ok(parts.includes("--no-mcp"));
+      assert.ok(parts.includes("'builtin:codemode'"));
+      assert.ok(parts.includes("'/runner/index.ts'"));
+      assert.ok(parts.some((part) => part.endsWith("tool-policy.ts'")));
+    });
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1409,73 +2890,6 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
-    });
-  });
-
-  it("applySandboxToParts loads Kilo for restricted launches and snapshot resumes", async () => {
-    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
-      const previousHome = process.env.HOME;
-      process.env.HOME = join(projectDir, "home");
-      const provider = join(globalDir, "npm", "node_modules", "pi-kilocode", "src", "index.ts");
-      mkdirSync(dirname(provider), { recursive: true });
-      writeFileSync(provider, "export default function () {}\n");
-      const loadout: SubagentLoadout = {
-        agent: "scout", toolAllowlist: "read,ask_question",
-        model: "kilocode/nvidia/nemotron-3-ultra-550b-a55b:free", thinking: "low",
-        identity: null, systemPromptMode: null, spawnable: null,
-        autoExit: true, cwd: null, agentDir: globalDir,
-      };
-      const options = { artifactDir: projectDir, name: "scout" };
-      try {
-        const initial: string[] = [];
-        testApi.applySandboxToParts(initial, loadout, options);
-        assert.deepEqual(initial, [
-          "--model", shellEscape(`${loadout.model}:low`),
-          "--no-extensions", "--tools", "'read,ask_question'", "-e", shellEscape(provider),
-        ]);
-        const sessionFile = join(projectDir, "child.jsonl");
-        writeSubagentLoadout(sessionFile, loadout);
-        const resumed: string[] = [];
-        testApi.applySandboxToParts(resumed, readSubagentLoadout(sessionFile)!, options);
-        assert.deepEqual(resumed, initial);
-
-        // Role-local agent dirs still find the standard global provider install.
-        const homeProvider = join(process.env.HOME, ".pi", "agent", "npm", "node_modules", "pi-kilocode", "src", "index.ts");
-        mkdirSync(dirname(homeProvider), { recursive: true });
-        writeFileSync(homeProvider, "export default function () {}\n");
-        process.env.PI_CODING_AGENT_DIR = join(projectDir, "role-agent-dir");
-        const nested: string[] = [];
-        testApi.applySandboxToParts(nested, loadout, options);
-        assert.equal(nested[nested.indexOf("-e") + 1], shellEscape(homeProvider));
-        assert.ok(nested.includes("--no-extensions"));
-
-        const native: string[] = [];
-        testApi.applySandboxToParts(native, { ...loadout, model: "zai/glm-5.3" }, options);
-        assert.ok(!native.includes("-e"), "native providers do not load Kilo");
-        assert.ok(native.includes("--no-extensions"));
-      } finally {
-        restoreEnvVar("HOME", previousHome);
-      }
-    });
-  });
-
-  it("applySandboxToParts reports a missing Kilo provider without enabling discovery", async () => {
-    await withIsolatedAgentEnv(async ({ projectDir }) => {
-      const previousHome = process.env.HOME;
-      process.env.HOME = join(projectDir, "empty-home");
-      const parts: string[] = [];
-      try {
-        assert.throws(() => testApi.applySandboxToParts(parts, {
-          agent: "scout", toolAllowlist: "read",
-          model: "kilocode/nvidia/nemotron-3-ultra-550b-a55b:free", thinking: null,
-          identity: null, systemPromptMode: null, spawnable: null,
-          autoExit: true, cwd: null, agentDir: null,
-        }, { artifactDir: projectDir, name: "scout" }), /pi install npm:pi-kilocode/);
-        assert.ok(parts.includes("--no-extensions"));
-        assert.ok(parts.includes("--tools"));
-      } finally {
-        restoreEnvVar("HOME", previousHome);
-      }
     });
   });
 
@@ -1525,21 +2939,33 @@ describe("subagent discovery", () => {
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
+      testApi.buildPiPromptArgs({
+        effectiveSkills: "review,lint",
+        taskDelivery: "artifact",
+        taskArg: "@artifact.md",
+      }),
       ["", "/skill:review", "/skill:lint", "@artifact.md"],
     );
   });
 
   it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
     assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
+      testApi.buildPiPromptArgs({
+        effectiveSkills: undefined,
+        taskDelivery: "artifact",
+        taskArg: "@artifact.md",
+      }),
       ["@artifact.md"],
     );
   });
 
   it("buildPiPromptArgs omits separator for direct launches with skills", () => {
     assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
+      testApi.buildPiPromptArgs({
+        effectiveSkills: "review",
+        taskDelivery: "direct",
+        taskArg: "do the task",
+      }),
       ["/skill:review", "do the task"],
     );
   });
@@ -1549,24 +2975,21 @@ describe("subagent discovery", () => {
       writeAgentFile(
         projectAgentsDir,
         "visible-discovery-test-agent",
-        [
-          "name: visible-discovery-test-agent",
-          "description: Visible test agent",
-          "model: anthropic/test-visible",
-        ].join("\n"),
+        ["name: visible-discovery-test-agent", "description: Visible test agent", "model: anthropic/test-visible"].join(
+          "\n",
+        ),
       );
 
       const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      subagentsModule.default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+      const tool = findRegisteredTool(registeredTools, "subagents_list");
 
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
+      const result = await executeRegisteredTool(tool);
+      const agents = agentsFromToolResult(result);
 
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
-      assert.match(result.content[0].text, /visible-discovery-test-agent/);
+      assert.ok(agents.some((agent) => agent.name === "visible-discovery-test-agent"));
+      assert.match(textFromToolResult(result), /visible-discovery-test-agent/);
     });
   });
 
@@ -1585,16 +3008,18 @@ describe("subagent discovery", () => {
       );
 
       const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      subagentsModule.default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+      const tool = findRegisteredTool(registeredTools, "subagents_list");
 
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
+      const result = await executeRegisteredTool(tool);
+      const agents = agentsFromToolResult(result);
 
-      assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
+      assert.equal(
+        agents.some((agent) => agent.name === "hidden-discovery-test-agent"),
+        false,
+      );
+      assert.doesNotMatch(textFromToolResult(result), /hidden-discovery-test-agent/);
 
       const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
       assert.ok(loaded, "expected hidden agent to remain directly loadable");
@@ -1629,16 +3054,18 @@ describe("subagent discovery", () => {
       );
 
       const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      subagentsModule.default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+      const tool = findRegisteredTool(registeredTools, "subagents_list");
 
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
+      const result = await executeRegisteredTool(tool);
+      const agents = agentsFromToolResult(result);
 
-      assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
+      assert.equal(
+        agents.some((agent) => agent.name === "shadowed-discovery-test-agent"),
+        false,
+      );
+      assert.doesNotMatch(textFromToolResult(result), /shadowed-discovery-test-agent/);
 
       const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
       assert.ok(loaded, "expected project override to remain directly loadable");
@@ -1649,6 +3076,16 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  describe("shouldBlockSubagentInputForLoadout", () => {
+    it("allows only one initial prompt while policy validation is pending", () => {
+      assert.equal(shouldBlockSubagentInputForLoadout("pending", false), false);
+      assert.equal(shouldBlockSubagentInputForLoadout("pending", true), true);
+      assert.equal(shouldBlockSubagentInputForLoadout("validated", true), false);
+      assert.equal(shouldBlockSubagentInputForLoadout("ready", true), false);
+      assert.equal(shouldBlockSubagentInputForLoadout(undefined, false), true);
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1715,8 +3152,8 @@ describe("subagent-done.ts", () => {
       const messages = [{ role: "assistant", stopReason: "error" }];
       const info = findLatestAssistantError(messages);
       assert.ok(info);
-      assert.equal(info!.stopReason, "error");
-      assert.match(info!.errorMessage, /stopReason=error/);
+      assert.equal(info.stopReason, "error");
+      assert.match(info.errorMessage, /stopReason=error/);
     });
 
     it("returns null when messages is undefined or empty", () => {
@@ -1728,12 +3165,12 @@ describe("subagent-done.ts", () => {
   describe("runningChildrenCount", () => {
     const KEY = Symbol.for("pi-subagents/running-children-count");
     function withGlobal(value: unknown, run: () => void) {
-      const prev = (globalThis as any)[KEY];
-      (globalThis as any)[KEY] = value;
+      const prev = Reflect.get(globalThis, KEY);
+      Reflect.set(globalThis, KEY, value);
       try {
         run();
       } finally {
-        (globalThis as any)[KEY] = prev;
+        Reflect.set(globalThis, KEY, prev);
       }
     }
 
@@ -1744,16 +3181,33 @@ describe("subagent-done.ts", () => {
     });
 
     it("reflects the live child count published by index.ts", () => {
-      withGlobal(() => 3, () => {
-        assert.equal(runningChildrenCount(), 3);
-      });
+      withGlobal(
+        () => 3,
+        () => {
+          assert.equal(runningChildrenCount(), 3);
+        },
+      );
     });
 
     it("treats zero/negative/non-number/throwing getters as 0", () => {
-      withGlobal(() => 0, () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => -1, () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => "two", () => assert.equal(runningChildrenCount(), 0));
-      withGlobal(() => { throw new Error("boom"); }, () => assert.equal(runningChildrenCount(), 0));
+      withGlobal(
+        () => 0,
+        () => assert.equal(runningChildrenCount(), 0),
+      );
+      withGlobal(
+        () => -1,
+        () => assert.equal(runningChildrenCount(), 0),
+      );
+      withGlobal(
+        () => "two",
+        () => assert.equal(runningChildrenCount(), 0),
+      );
+      withGlobal(
+        () => {
+          throw new Error("boom");
+        },
+        () => assert.equal(runningChildrenCount(), 0),
+      );
     });
   });
 
@@ -1787,7 +3241,7 @@ describe("subagent-done.ts", () => {
         const names = mock.registeredTools.map((t) => t.name);
         assert.ok(names.includes("ask_question"));
         assert.ok(!names.includes("caller_ping"));
-        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        const tool = findRegisteredTool(mock.registeredTools, "ask_question");
         assert.deepEqual(Object.keys(tool.parameters.properties), ["question"]);
         assert.match(tool.description, /orchestrator/i);
       } finally {
@@ -1801,13 +3255,17 @@ describe("subagent-done.ts", () => {
       const sessionFile = join(dir, "s.jsonl");
       const { mock, restore } = setupSubagentExtension(sessionFile);
       try {
-        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        const tool = findRegisteredTool(mock.registeredTools, "ask_question");
         let shutdownCalled = false;
-        const ctx = { shutdown() { shutdownCalled = true; } } as any;
+        const ctx = {
+          shutdown() {
+            shutdownCalled = true;
+          },
+        };
         const out = await tool.execute("call-1", { question: "Which API base URL?" }, undefined, undefined, ctx);
 
         assert.equal(shutdownCalled, false, "ask_question must keep the session open");
-        assert.match(out.content[0].text, /wait/i);
+        assert.match(textFromToolResult(out), /wait/i);
 
         const askFile = `${sessionFile}.ask`;
         assert.ok(existsSync(askFile), ".ask signal file should be written");
@@ -1827,17 +3285,26 @@ describe("subagent-done.ts", () => {
     // asking run is still open fires `input` but NOT `agent_start`, so the flag
     // must be cleared on `input` or the session parks forever.
     function setupCapturingExtension(sessionFile: string) {
-      const handlers = new Map<string, Array<(...args: any[]) => void>>();
-      const tools: any[] = [];
+      const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+      const tools: TestRegisteredTool[] = [];
       const api = {
-        on(event: string, handler: (...args: any[]) => void) {
-          if (!handlers.has(event)) handlers.set(event, []);
-          handlers.get(event)!.push(handler);
+        on(event: string, handler: (...args: unknown[]) => void) {
+          const eventHandlers = handlers.get(event) ?? [];
+          eventHandlers.push(handler);
+          handlers.set(event, eventHandlers);
         },
-        registerTool(t: any) { tools.push(t); },
-        registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
-        sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
-      } as any;
+        registerTool(t: RegisteredTool) {
+          tools.push(adaptRegisteredTool(t));
+        },
+        registerCommand() {},
+        registerMessageRenderer() {},
+        registerShortcut() {},
+        sendUserMessage() {},
+        sendMessage() {},
+        getAllTools() {
+          return [];
+        },
+      } as unknown as ExtensionAPI;
       const saved = {
         session: process.env.PI_SUBAGENT_SESSION,
         name: process.env.PI_SUBAGENT_NAME,
@@ -1849,8 +3316,11 @@ describe("subagent-done.ts", () => {
       process.env.PI_SUBAGENT_AGENT = "scout";
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
       subagentDoneExtension(api);
-      const emit = (event: string, ...args: any[]) =>
-        (handlers.get(event) ?? []).forEach((h) => h(...args));
+      const emit = (event: string, ...args: unknown[]) => {
+        (handlers.get(event) ?? []).forEach((handler) => {
+          handler(...args);
+        });
+      };
       const restore = () => {
         restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
@@ -1858,8 +3328,10 @@ describe("subagent-done.ts", () => {
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
       };
       const ask = async () => {
-        const tool = tools.find((t) => t.name === "ask_question");
-        await tool.execute("c1", { question: "v1 or v2?" }, undefined, undefined, { shutdown() {} });
+        const tool = findRegisteredTool(tools, "ask_question");
+        await tool.execute("c1", { question: "v1 or v2?" }, undefined, undefined, {
+          shutdown() {},
+        });
       };
       return { emit, ask, restore };
     }
@@ -1873,8 +3345,17 @@ describe("subagent-done.ts", () => {
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown = true;
+            },
+          },
+        );
         assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+        assert.ok(existsSync(`${join(dir, "s.jsonl")}.shutdown-request`));
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1889,8 +3370,17 @@ describe("subagent-done.ts", () => {
         await ask();
         // No input yet — the orchestrator has not replied.
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown = true;
+            },
+          },
+        );
         assert.equal(shutdown, false, "pending question with no reply must park, not exit");
+        assert.equal(existsSync(`${join(dir, "s.jsonl")}.shutdown-request`), false);
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1904,13 +3394,29 @@ describe("subagent-done.ts", () => {
         emit("agent_start");
         await ask();
         let shutdown1 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown1 = true;
+            },
+          },
+        );
         assert.equal(shutdown1, false, "parks while waiting");
         // Reply arrives as a fresh turn after the subagent had parked.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
+        emit(
+          "agent_end",
+          { messages: [] },
+          {
+            shutdown() {
+              shutdown2 = true;
+            },
+          },
+        );
         assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
       } finally {
         restore();
@@ -1920,16 +3426,143 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
+describe("tmux.ts exit sidecars", () => {
+  const { interpretExitSidecar, readProcessExitSidecar } = __pollForExitTest__;
+
+  it("times out only after a genuine shutdown request exceeds its grace period", () => {
+    const { checkShutdownRequestTimeout } = __pollForExitTest__;
+    withTempDir((dir) => {
+      const requestFile = join(dir, "child.shutdown-request");
+      assert.equal(checkShutdownRequestTimeout(requestFile, 1_000, 5_000), undefined);
+      writeFileSync(requestFile, JSON.stringify({ requestedAt: 4_500 }));
+      assert.equal(checkShutdownRequestTimeout(requestFile, 1_000, 5_499), undefined);
+      assert.deepEqual(checkShutdownRequestTimeout(requestFile, 1_000, 5_500), {
+        reason: "error",
+        exitCode: 124,
+        error: "shutdown-timeout",
+        shutdownRequestedAt: 4_500,
+        shutdownElapsedMs: 1_000,
+      });
+      writeFileSync(requestFile, "invalid");
+      assert.equal(checkShutdownRequestTimeout(requestFile, 1_000, 9_000), undefined);
+    });
+  });
+
+  it("detects a shutdown request that exceeds its deadline without waiting for tmux output", async () => {
+    const dir = createTestDir();
+    try {
+      const shutdownRequestFile = join(dir, "child.shutdown-request");
+      writeFileSync(shutdownRequestFile, JSON.stringify({ requestedAt: 1 }));
+      const result = await pollForExit("unused", new AbortController().signal, {
+        interval: 1,
+        shutdownRequestFile,
+        shutdownTimeoutMs: 1,
+        now: () => 10_000,
+      });
+      assert.deepEqual(result, {
+        reason: "error",
+        exitCode: 124,
+        error: "shutdown-timeout",
+        shutdownRequestedAt: 1,
+        shutdownElapsedMs: 9_999,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a process exit that arrives within the shutdown grace period", async () => {
+    const dir = createTestDir();
+    try {
+      const processExitFile = join(dir, "child.process-exit");
+      const shutdownRequestFile = join(dir, "child.shutdown-request");
+      writeFileSync(shutdownRequestFile, JSON.stringify({ requestedAt: 1_000 }));
+      let now = 1_500;
+      const result = await pollForExit("unused", new AbortController().signal, {
+        interval: 1,
+        processExitFile,
+        shutdownRequestFile,
+        shutdownTimeoutMs: 1_000,
+        now: () => now,
+        onTick() {
+          writeFileSync(processExitFile, JSON.stringify({ type: "process_exit", exitCode: 0 }));
+          now = 1_999;
+        },
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers a process exit that races with the shutdown deadline", async () => {
+    const dir = createTestDir();
+    try {
+      const processExitFile = join(dir, "child.process-exit");
+      const shutdownRequestFile = join(dir, "child.shutdown-request");
+      writeFileSync(shutdownRequestFile, JSON.stringify({ requestedAt: 1 }));
+      const result = await pollForExit("unused", new AbortController().signal, {
+        interval: 1,
+        processExitFile,
+        shutdownRequestFile,
+        shutdownTimeoutMs: 1,
+        now: () => {
+          writeFileSync(processExitFile, JSON.stringify({ type: "process_exit", exitCode: 0 }));
+          return 10_000;
+        },
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers confirmed process exit over an expired shutdown deadline", async () => {
+    const dir = createTestDir();
+    try {
+      const processExitFile = join(dir, "child.process-exit");
+      const shutdownRequestFile = join(dir, "child.shutdown-request");
+      writeFileSync(processExitFile, JSON.stringify({ type: "process_exit", exitCode: 0 }));
+      writeFileSync(shutdownRequestFile, JSON.stringify({ requestedAt: 1 }));
+      const result = await pollForExit("unused", new AbortController().signal, {
+        interval: 1,
+        processExitFile,
+        shutdownRequestFile,
+        shutdownTimeoutMs: 1,
+        now: () => 10_000,
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes a timestamped shutdown request atomically for the parent watcher", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      writeSubagentShutdownRequest(sessionFile, 1234);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.shutdown-request`, "utf8")), { requestedAt: 1234 });
+    });
+  });
+
+  it("reads durable process exit codes and ignores malformed or incomplete records", () => {
+    withTempDir((dir) => {
+      const processExitFile = join(dir, "child.process-exit");
+      assert.equal(readProcessExitSidecar(processExitFile), undefined);
+      writeFileSync(processExitFile, '{"type":"process_exit","exitCode":7}');
+      assert.deepEqual(readProcessExitSidecar(processExitFile), { reason: "sentinel", exitCode: 7 });
+      writeFileSync(processExitFile, '{"type":"process_exit","exitCode":"0"}');
+      assert.equal(readProcessExitSidecar(processExitFile), undefined);
+    });
+  });
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
     // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
     // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
+    assert.deepEqual(interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }), {
+      reason: "done",
+      exitCode: 0,
+    });
   });
 
   it("decodes done payloads", () => {
@@ -1970,10 +3603,9 @@ describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
 
-    const subagent = registeredCommands.find((command) => command.name === "subagent");
-    assert.ok(subagent, "expected /subagent to be registered");
+    const subagent = findRegisteredCommand(registeredCommands, "subagent");
 
     subagent.handler("scout map the auth code", {
       ui: { notify() {} },
@@ -1985,13 +3617,17 @@ describe("commands", () => {
   });
 
   it("scrolls the model catalog with a ten-row window and searchable metadata", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     const items = Array.from({ length: 15 }, (_, index) => ({
       value: `provider-${index}/model-${index}`,
       label: `provider-${index}/model-${index}`,
       description: `Friendly ${index} · 32,000 ctx`,
     }));
-    items.push({ value: "__manual_model__", label: "Enter provider/model ID manually", description: "Use an ID not listed in Pi" });
+    items.push({
+      value: "__manual_model__",
+      label: "Enter provider/model ID manually",
+      description: "Use an ID not listed in Pi",
+    });
     const actions: Record<string, string> = {
       "tui.select.up": "UP",
       "tui.select.down": "DOWN",
@@ -2000,14 +3636,16 @@ describe("commands", () => {
     };
     let selected: string | undefined;
     const picker = new testApi.ScrollableModelPicker(
-      { requestRender() {} },
-      { fg: (_color: string, text: string) => text },
-      { matches: (data: string, action: string) => data === actions[action] },
+      { requestRender() {} } as TUI,
+      { fg: (_color: string, text: string) => text } as Theme,
+      { matches: (data: string, action: string) => data === actions[action] } as KeybindingsManager,
       items,
-      (value: string | undefined) => { selected = value; },
+      (value: string | undefined) => {
+        selected = value;
+      },
     );
 
-    let lines = picker.render(120);
+    const lines = picker.render(120);
     assert.equal(lines[0], "─".repeat(120));
     assert.equal(lines.at(-1), "─".repeat(120));
     let visible = lines.join("\n");
@@ -2026,11 +3664,13 @@ describe("commands", () => {
 
     let preselected: string | undefined;
     const savedModelPicker = new testApi.ScrollableModelPicker(
-      { requestRender() {} },
-      { fg: (_color: string, text: string) => text },
-      { matches: (data: string, action: string) => data === actions[action] },
+      { requestRender() {} } as TUI,
+      { fg: (_color: string, text: string) => text } as Theme,
+      { matches: (data: string, action: string) => data === actions[action] } as KeybindingsManager,
       items,
-      (value: string | undefined) => { preselected = value; },
+      (value: string | undefined) => {
+        preselected = value;
+      },
       { initialValue: "provider-10/model-10", title: "Choose a model" },
     );
     savedModelPicker.handleInput("ENTER");
@@ -2038,22 +3678,49 @@ describe("commands", () => {
   });
 
   it("filters thinking choices by model capabilities and includes all levels for unknown models", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     assert.deepEqual(testApi.thinkingLevelsForModel(undefined), ["off", "minimal", "low", "medium", "high", "xhigh"]);
     assert.deepEqual(testApi.thinkingLevelsForModel({ id: "unknown", reasoning: false }), ["off"]);
-    assert.deepEqual(testApi.thinkingLevelsForModel({ id: "gpt-4o", reasoning: true }), ["off", "minimal", "low", "medium", "high"]);
-    assert.deepEqual(testApi.thinkingLevelsForModel({ id: "gpt-5.3", reasoning: true }), ["off", "minimal", "low", "medium", "high", "xhigh"]);
-    assert.deepEqual(testApi.thinkingLevelsForModel({ id: "gpt-5.3", reasoning: true }, null), ["off", "minimal", "low", "medium", "high"]);
-    const selectedModel = { provider: "openai", id: "parent", name: "Parent", contextWindow: 32_000 } as any;
+    assert.deepEqual(testApi.thinkingLevelsForModel({ id: "gpt-4o", reasoning: true }), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+    assert.deepEqual(testApi.thinkingLevelsForModel({ id: "gpt-5.3", reasoning: true }), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    assert.deepEqual(testApi.thinkingLevelsForModel({ id: "gpt-5.3", reasoning: true }, null), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+    const selectedModel = {
+      provider: "openai",
+      id: "parent",
+      name: "Parent",
+      contextWindow: 32_000,
+    } satisfies TestModelLike;
     assert.equal(testApi.preferredModelId(undefined, selectedModel), "openai/parent");
     const pickerItems = testApi.modelPickerItems([selectedModel], "custom/provider/model");
     assert.equal(pickerItems[0].value, "custom/provider/model");
-    assert.equal(testApi.thinkingPickerItems({ id: "gpt-4o", reasoning: true }, "xhigh").initialValue, "__pi_default_thinking__");
+    assert.equal(
+      testApi.thinkingPickerItems({ id: "gpt-4o", reasoning: true }, "xhigh").initialValue,
+      "__pi_default_thinking__",
+    );
     assert.equal(testApi.thinkingPickerItems({ id: "gpt-4o", reasoning: true }, "high").initialValue, "high");
   });
 
   it("saves a Pi-default thinking choice by removing its frontmatter field", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     const content = "---\nname: test-agent\nmodel: openai/old\nthinking: high\ntools: read\n---\nAgent body\n";
     const updated = testApi.updateAgentDefaults(content, "openai/new", null);
     assert.ok(updated);
@@ -2065,11 +3732,19 @@ describe("commands", () => {
 
   it("/subagents lets the user choose a model for one spawn", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
     assert.ok(command, "expected /subagents to be registered");
 
-    const models = [{ provider: "anthropic", id: "claude-test", name: "Claude Test", contextWindow: 200_000, reasoning: true }];
+    const models = [
+      {
+        provider: "anthropic",
+        id: "claude-test",
+        name: "Claude Test",
+        contextWindow: 200_000,
+        reasoning: true,
+      },
+    ];
     const commandCtx = {
       cwd: process.cwd(),
       mode: "tui",
@@ -2080,7 +3755,14 @@ describe("commands", () => {
           if (title === "Choose an agent") return options.find((option) => option === "scout");
           if (title === "Choose an action") return options.find((option) => option === "Spawn once");
           if (title === "Choose a model") {
-            assert.ok(options.some((option) => option.includes("Claude Test") && option.includes("anthropic/claude-test") && option.includes("200,000 ctx")));
+            assert.ok(
+              options.some(
+                (option) =>
+                  option.includes("Claude Test") &&
+                  option.includes("anthropic/claude-test") &&
+                  option.includes("200,000 ctx"),
+              ),
+            );
             return options.find((option) => option.includes("anthropic/claude-test"));
           }
           return undefined;
@@ -2100,8 +3782,8 @@ describe("commands", () => {
 
   it("/subagents preselects saved model and thinking for a one-off spawn", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
     const dir = createTestDir();
     const agentsDir = join(dir, ".pi", "agents");
     writeAgentFile(agentsDir, "picker-agent", "name: picker-agent\nmodel: openai/saved\nthinking: high");
@@ -2137,8 +3819,8 @@ describe("commands", () => {
 
   it("/subagents preselects the parent model and Pi default when the agent has no defaults", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
     const dir = createTestDir();
     const agentsDir = join(dir, ".pi", "agents");
     writeAgentFile(agentsDir, "picker-agent", "name: picker-agent");
@@ -2175,16 +3857,15 @@ describe("commands", () => {
 
   it("/subagents accepts an unlisted manual model ID with a warning", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
-    const notices: Array<{ message: string; level: string }> = [];
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
+    const notices: Array<{ message: string; level?: "error" | "info" | "warning" }> = [];
 
     await command.handler("", {
       cwd: process.cwd(),
       mode: "tui",
       modelRegistry: { getAvailable: () => [] },
       ui: {
-        custom: chooseFromCustomModelPicker(),
         select: async (title: string, options: string[]) => {
           if (title === "Choose an agent") return options.find((option) => option === "scout");
           if (title === "Choose an action") return options.find((option) => option === "Spawn once");
@@ -2192,8 +3873,10 @@ describe("commands", () => {
           return undefined;
         },
         custom: chooseFromCustomModelPicker(1),
-        input: async (title: string) => title === "Enter provider/model ID" ? "custom/provider/model" : "inspect",
-        notify(message: string, level: string) { notices.push({ message, level }); },
+        input: async (title: string) => (title === "Enter provider/model ID" ? "custom/provider/model" : "inspect"),
+        notify(message: string, level?: "error" | "info" | "warning") {
+          notices.push({ message, level });
+        },
       },
     });
 
@@ -2204,16 +3887,15 @@ describe("commands", () => {
 
   it("/subagents rejects malformed manual model IDs before spawning", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
-    const notices: Array<{ message: string; level: string }> = [];
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
+    const notices: Array<{ message: string; level?: "error" | "info" | "warning" }> = [];
 
     await command.handler("", {
       cwd: process.cwd(),
       mode: "tui",
       modelRegistry: { getAvailable: () => [] },
       ui: {
-        custom: chooseFromCustomModelPicker(),
         select: async (title: string, options: string[]) => {
           if (title === "Choose an agent") return options.find((option) => option === "scout");
           if (title === "Choose an action") return options.find((option) => option === "Spawn once");
@@ -2221,8 +3903,10 @@ describe("commands", () => {
           return undefined;
         },
         custom: chooseFromCustomModelPicker(1),
-        input: async (title: string) => title === "Enter provider/model ID" ? "missing-provider" : undefined,
-        notify(message: string, level: string) { notices.push({ message, level }); },
+        input: async (title: string) => (title === "Enter provider/model ID" ? "missing-provider" : undefined),
+        notify(message: string, level?: "error" | "info" | "warning") {
+          notices.push({ message, level });
+        },
       },
     });
 
@@ -2232,8 +3916,8 @@ describe("commands", () => {
 
   it("/subagents explains when a global default is shadowed by a project agent", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
     const dir = createTestDir();
     const agentsDir = join(dir, ".pi", "agents");
     writeAgentFile(agentsDir, "project-agent", "name: project-agent\nmodel: openai/old");
@@ -2243,7 +3927,9 @@ describe("commands", () => {
       await command.handler("", {
         cwd: dir,
         mode: "tui",
-        modelRegistry: { getAvailable: () => [{ provider: "openai", id: "new", name: "New", contextWindow: 16_000, reasoning: true }] },
+        modelRegistry: {
+          getAvailable: () => [{ provider: "openai", id: "new", name: "New", contextWindow: 16_000, reasoning: true }],
+        },
         ui: {
           custom: chooseFromCustomModelPicker(1),
           select: async (title: string, options: string[]) => {
@@ -2274,12 +3960,22 @@ describe("commands", () => {
 
   it("/subagents saves a project default without losing the agent profile", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
     const dir = createTestDir();
     const projectAgents = join(dir, ".pi", "agents");
-    writeAgentFile(projectAgents, "local-agent", "name: local-agent\nmodel: openai/model-test\nthinking: low\ntools: read, write\nsystem-prompt: append");
-    const model = { provider: "openai", id: "model-test", name: "Test Model", contextWindow: 32_000, reasoning: true };
+    writeAgentFile(
+      projectAgents,
+      "local-agent",
+      "name: local-agent\nmodel: openai/model-test\nthinking: low\ntools: read, write\nsystem-prompt: append",
+    );
+    const model = {
+      provider: "openai",
+      id: "model-test",
+      name: "Test Model",
+      contextWindow: 32_000,
+      reasoning: true,
+    };
 
     try {
       await command.handler("", {
@@ -2313,12 +4009,18 @@ describe("commands", () => {
 
   it("/subagents removes a saved thinking field when Pi default is saved", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
     const dir = createTestDir();
     const projectAgents = join(dir, ".pi", "agents");
     writeAgentFile(projectAgents, "local-agent", "name: local-agent\nmodel: openai/model-test\nthinking: high");
-    const model = { provider: "openai", id: "model-test", name: "Test Model", contextWindow: 32_000, reasoning: true };
+    const model = {
+      provider: "openai",
+      id: "model-test",
+      name: "Test Model",
+      contextWindow: 32_000,
+      reasoning: true,
+    };
 
     try {
       await command.handler("", {
@@ -2348,8 +4050,8 @@ describe("commands", () => {
 
   it("/subagents cancellation before selection has no side effects", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const command = registeredCommands.find((entry) => entry.name === "subagents");
+    subagentsModule.default(api);
+    const command = findRegisteredCommand(registeredCommands, "subagents");
     assert.ok(command, "expected /subagents to be registered");
 
     await command.handler("", {
@@ -2364,17 +4066,18 @@ describe("commands", () => {
 
   it("subagents_list shows configured defaults and the Pi fallback", async () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const tool = registeredTools.find((entry) => entry.name === "subagents_list");
+    subagentsModule.default(api);
+    const tool = findRegisteredTool(registeredTools, "subagents_list");
     const dir = createTestDir();
     const projectAgents = join(dir, ".pi", "agents");
     writeAgentFile(projectAgents, "with-model", "name: with-model\nmodel: openai/model-x");
     writeAgentFile(projectAgents, "without-model", "name: without-model");
 
     try {
-      const result = await tool.execute("call", {}, undefined, undefined, { cwd: dir });
-      assert.match(result.content[0].text, /with-model \(project\) \[openai\/model-x\]/);
-      assert.match(result.content[0].text, /without-model \(project\) \[Pi default\]/);
+      const result = await executeRegisteredTool(tool, {}, { cwd: dir });
+      const output = textFromToolResult(result);
+      assert.match(output, /with-model \(project\) \[openai\/model-x\]/);
+      assert.match(output, /without-model \(project\) \[Pi default\]/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2382,15 +4085,21 @@ describe("commands", () => {
 
   it("does not register the removed /iterate or /plan commands", () => {
     const { api, registeredCommands } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
-    assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
+    subagentsModule.default(api);
+    assert.equal(
+      registeredCommands.find((c) => c.name === "iterate"),
+      undefined,
+    );
+    assert.equal(
+      registeredCommands.find((c) => c.name === "plan"),
+      undefined,
+    );
   });
 });
 
 describe("tool registration", () => {
   it("always resumes subagents as autonomous (auto-exit, non-interactive tracking)", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
 
     assert.deepEqual(testApi.resolveResumeLaunchBehavior(), {
       autoExit: true,
@@ -2398,22 +4107,21 @@ describe("tool registration", () => {
     });
   });
 
-
   it("rejects a top-level spawn with no agent and no fork", async () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    subagentsModule.default(api);
+    const subagentTool = findRegisteredTool(registeredTools, "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const result = await subagentTool.execute("call-1", { name: "x", task: "do it" });
     assert.equal(result.details?.error, "agent required");
-    assert.match(result.content[0].text, /specify which agent/i);
+    assert.match(textFromToolResult(result), /specify which agent/i);
   });
 
   it("rejects a top-level spawn naming an unknown agent", async () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    subagentsModule.default(api);
+    const subagentTool = findRegisteredTool(registeredTools, "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const result = await subagentTool.execute("call-1", {
@@ -2422,14 +4130,14 @@ describe("tool registration", () => {
       agent: "wizard",
     });
     assert.equal(result.details?.error, "unknown agent");
-    assert.match(result.content[0].text, /not a known agent/i);
+    assert.match(textFromToolResult(result), /not a known agent/i);
   });
 
   it("exposes a debloated schema with an optional model and thinking override", () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
 
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const subagentTool = findRegisteredTool(registeredTools, "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const props = subagentTool.parameters.properties;
@@ -2444,7 +4152,7 @@ describe("tool registration", () => {
       "agent and task must be required",
     );
     // `name` is now optional and purely cosmetic.
-    assert.match(props.name.description, /cosmetic/i);
+    assert.match(props.name.description ?? "", /cosmetic/i);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
@@ -2453,9 +4161,9 @@ describe("tool registration", () => {
 
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
 
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const subagentTool = findRegisteredTool(registeredTools, "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const theme = {
@@ -2466,7 +4174,9 @@ describe("tool registration", () => {
         return text;
       },
     };
-    const rendered = subagentTool.renderCall({}, theme);
+    if (!subagentTool.renderCall) throw new Error("Expected subagent tool renderCall");
+    const rendered = subagentTool.renderCall({}, theme as Theme);
+    if (!rendered) throw new Error("Expected status renderer component");
     const output = rendered.render(80).join("\n");
 
     assert.match(output, /\(unnamed\)/);
@@ -2474,9 +4184,9 @@ describe("tool registration", () => {
 
   it("registers subagent_message with name + message both required (name-only addressing)", () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
 
-    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+    const messageTool = findRegisteredTool(registeredTools, "subagent_message");
     assert.ok(messageTool, "expected subagent_message tool to be registered");
 
     const props = messageTool.parameters.properties;
@@ -2496,9 +4206,19 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
+  it("tells the parent to yield instead of waiting in reasoning after spawning", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const tool = findRegisteredTool(registeredTools, "subagent");
+    for (const guidance of [tool.description, tool.promptSnippet ?? ""]) {
+      assert.match(guidance, /Do not wait in reasoning/);
+      assert.match(guidance, /end your turn immediately/);
+    }
+  });
+
   it("no longer registers subagent_interrupt or subagent_resume", () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_interrupt"), false);
     assert.equal(names.includes("subagent_resume"), false);
@@ -2678,7 +4398,7 @@ describe("subagent activity snapshots", () => {
 });
 
 describe("subagent interruption", () => {
-  function makeRunning(overrides: Record<string, unknown> = {}) {
+  function makeRunning(overrides: Partial<RunningSubagent> = {}): RunningSubagent {
     return {
       id: "a1",
       name: "Worker",
@@ -2694,7 +4414,7 @@ describe("subagent interruption", () => {
 
   it("registers subagent_message and not the old interrupt/resume tools", () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_message"), true);
     assert.equal(names.includes("subagent_interrupt"), false);
@@ -2702,8 +4422,8 @@ describe("subagent interruption", () => {
   });
 
   it("resolves a running subagent by exact name and reports ambiguity", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const testApi = testHelpers;
+    const runningMap = testApi.runningSubagents;
     runningMap.clear();
 
     try {
@@ -2712,12 +4432,15 @@ describe("subagent interruption", () => {
       runningMap.set("c3", makeRunning({ id: "c3", name: "Scout", surface: "c3", sessionFile: "c3.jsonl" }));
 
       const byName = testApi.resolveRunningByName("Scout");
+      assertResolvedRunning(byName);
       assert.equal(byName.running.id, "c3");
 
       const ambiguous = testApi.resolveRunningByName("Worker");
+      assertResolveError(ambiguous);
       assert.match(ambiguous.error, /Ambiguous subagent name/);
 
       const missing = testApi.resolveRunningByName("Ghost");
+      assertResolveError(missing);
       assert.match(missing.error, /No running subagent named "Ghost"/);
     } finally {
       runningMap.clear();
@@ -2725,8 +4448,8 @@ describe("subagent interruption", () => {
   });
 
   it("uniqueRunningName suffixes defaulted names that collide with running subagents", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const testApi = testHelpers;
+    const runningMap = testApi.runningSubagents;
     runningMap.clear();
 
     try {
@@ -2747,8 +4470,8 @@ describe("subagent interruption", () => {
   });
 
   it("uniqueRunningName also avoids names already taken in the persistent registry", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const testApi = testHelpers;
+    const runningMap = testApi.runningSubagents;
     const reserved = testApi.reservedNames as Set<string>;
     runningMap.clear();
     reserved.clear();
@@ -2769,8 +4492,8 @@ describe("subagent interruption", () => {
   });
 
   it("uniqueRunningName also avoids names reserved by in-flight parallel spawns", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const testApi = testHelpers;
+    const runningMap = testApi.runningSubagents;
     const reserved = testApi.reservedNames as Set<string>;
     runningMap.clear();
     reserved.clear();
@@ -2790,7 +4513,7 @@ describe("subagent interruption", () => {
   });
 
   it("steers a running subagent by typing into its pane (newlines flattened)", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     let sentSurface = "";
     let sentText = "";
     const running = makeRunning();
@@ -2806,19 +4529,20 @@ describe("subagent interruption", () => {
   });
 
   it("returns an explicit error when steering delivery fails", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     const running = makeRunning();
 
     const result = testApi.steerSubagent(running, "hi", () => {
       throw new Error("mux write failed");
     });
 
+    assertToolError(result);
     assert.match(result.error, /Failed to deliver message/);
   });
 
   it("delivers a steer message and forces local status waiting", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const testApi = testHelpers;
+    const runningMap = testApi.runningSubagents;
     let sentSurface = "";
     let sentText = "";
     runningMap.clear();
@@ -2850,9 +4574,9 @@ describe("subagent interruption", () => {
 
       assert.equal(sentSurface, "pane-1");
       assert.equal(sentText, "keep going");
-      assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
+      assert.match(textFromToolResult(result), /Message delivered to running subagent "Worker"/);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
-      const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
+      const snapshot = classifyStatus(getRunning(runningMap, "a1").statusState, 20_000);
       assert.equal(snapshot.kind, "waiting");
       assert.equal(runningMap.has("a1"), true);
     } finally {
@@ -2861,21 +4585,21 @@ describe("subagent interruption", () => {
   });
 
   it("requires a message when steering", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const testApi = testHelpers;
+    const runningMap = testApi.runningSubagents;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
       const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
-      assert.match(result.content[0].text, /`message` is required/);
+      assert.match(textFromToolResult(result), /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
   it("leaves status unchanged when steering delivery fails in the tool path", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const testApi = testHelpers;
+    const runningMap = testApi.runningSubagents;
     runningMap.clear();
 
     const activeState = observeStatus(
@@ -2902,15 +4626,59 @@ describe("subagent interruption", () => {
         }),
       );
 
-      assert.match(result.content[0].text, /Failed to deliver message/);
-      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
+      assert.match(textFromToolResult(result), /Failed to deliver message/);
+      assert.equal(classifyStatus(getRunning(runningMap, "a1").statusState, 20_000).kind, "active");
     } finally {
       runningMap.clear();
     }
   });
 
+  it("prevents child acknowledgement loops while preserving parent summaries", () => {
+    for (const result of [
+      { exitCode: 0, summary: "Done." },
+      { exitCode: 1, summary: "Failed." },
+      { exitCode: 1, summary: "Failed.", errorMessage: "Provider unavailable" },
+    ]) {
+      const presentation = subagentsModule.__test__.resolveResultPresentation(
+        { ...result, elapsed: 1, sessionFile: "/tmp/subagent.jsonl" },
+        "Worker",
+      );
+      assert.match(presentation, /Do not acknowledge this completion via subagent_message/);
+      assert.match(presentation, /Only use subagent_message if you have additional work/);
+      assert.match(presentation, /Continue the parent task and summarize results for the user when ready/);
+      assert.doesNotMatch(presentation, /No reply is needed|Completion notifications need no reply/);
+      assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
+      assert.doesNotMatch(presentation, /Follow up with/);
+    }
+  });
+
+  it("yields promptly with pending children and summarizes when the last child finishes", () => {
+    const result = { exitCode: 0, elapsed: 1, summary: "FFF tools passed.", sessionFile: "/tmp/scout.jsonl" };
+    const pending = subagentsModule.__test__.resolveResultPresentation(result, "Scout", ["Worker"]);
+    assert.match(pending, /1 subagent still running: Worker/);
+    assert.match(pending, /end this turn immediately/);
+    assert.match(pending, /Do not wait in reasoning/);
+    assert.match(pending, /Do not message a child just to check/);
+
+    const complete = subagentsModule.__test__.resolveResultPresentation(result, "Worker", []);
+    assert.match(complete, /No subagents remain running/);
+    assert.match(complete, /Summarize the completed results for the user now/);
+    assert.doesNotMatch(complete, /end this turn immediately/);
+  });
+
+  it("scopes message-tool completion guidance to child messages, not user summaries", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const tool = findRegisteredTool(registeredTools, "subagent_message");
+    for (const guidance of [tool.description, tool.promptSnippet ?? ""]) {
+      assert.match(guidance, /Do not acknowledge completion via subagent_message/);
+      assert.match(guidance, /Continue the parent task and summarize results for the user when ready/);
+      assert.doesNotMatch(guidance, /No reply is needed|Completion notifications need no reply/);
+    }
+  });
+
   it("formats exit code 130 as an ordinary failure", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     const presentation = testApi.resolveResultPresentation(
       {
         exitCode: 130,
@@ -2935,7 +4703,7 @@ describe("subagent interruption", () => {
     // quickly. With the error sidecar plumbed through, the presentation
     // must call out the failure, include the underlying error, and tell the
     // orchestrator how to recover.
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     const presentation = testApi.resolveResultPresentation(
       {
         exitCode: 1,
@@ -2957,6 +4725,53 @@ describe("subagent interruption", () => {
   });
 });
 
+describe("subagent completion publication", () => {
+  it("keeps the published result when the wake-up cannot be sent", () => {
+    const published: Array<Parameters<ExtensionAPI["sendMessage"]>[0]> = [];
+    const result = { customType: "subagent_result", content: "Both FFF tools passed.", display: true };
+    const pi = {
+      sendMessage(
+        message: Parameters<ExtensionAPI["sendMessage"]>[0],
+        options?: Parameters<ExtensionAPI["sendMessage"]>[1],
+      ) {
+        if (options?.triggerTurn) throw new Error("wake-up rejected");
+        published.push(message);
+      },
+    };
+    assert.doesNotThrow(() => publishSubagentCompletion(pi, result, []));
+    assert.deepEqual(published, [result]);
+  });
+});
+
+describe("subagent result renderer", () => {
+  it("hides completion guidance from displayed summaries, including historical footers", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const entry = registeredMessageRenderers.find((item) => item.name === "subagent_result");
+    assert.ok(entry);
+    const current = subagentsModule.__test__.resolveResultPresentation(
+      { exitCode: 0, elapsed: 1, summary: "Both FFF tools succeeded.", sessionFile: "/tmp/worker.jsonl" },
+      "Worker",
+    );
+    const header = 'Sub-agent "Worker" completed (1s).\n\nBoth FFF tools succeeded.';
+    for (const content of [
+      current,
+      `${header}\n\nNo reply is needed. Only use subagent_message if you have additional work.`,
+      `${header}\n\nFollow up with subagent_message for additional work.`,
+    ]) {
+      const rendered = entry.renderer(
+        { customType: "subagent_result", content, details: { name: "Worker", exitCode: 0, elapsed: 1 } },
+        { expanded: true },
+        { fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text },
+      );
+      assert.ok(rendered);
+      const output = rendered.render(120).join("\n");
+      assert.match(output, /Both FFF tools succeeded/);
+      assert.doesNotMatch(output, /Do not acknowledge|Continue the parent task|No reply is needed|Follow up with/);
+    }
+  });
+});
+
 describe("subagent status renderer", () => {
   function createTheme() {
     return {
@@ -2974,7 +4789,7 @@ describe("subagent status renderer", () => {
 
   it("renders only capped lines plus overflow", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
 
     const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_status");
     assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
@@ -2987,6 +4802,9 @@ describe("subagent status renderer", () => {
     ];
     const rendered = rendererEntry.renderer(
       {
+        role: "custom",
+        display: true,
+        timestamp: Date.now(),
         customType: "subagent_status",
         content: "Subagent status:\n• Worker running 5m, active (bash 2m).",
         details: {
@@ -2997,6 +4815,7 @@ describe("subagent status renderer", () => {
       { expanded: true },
       createTheme(),
     );
+    if (!rendered) throw new Error("Expected status renderer component");
     const output = rendered.render(80).join("\n");
 
     assert.match(output, /Subagent status/);
@@ -3008,13 +4827,16 @@ describe("subagent status renderer", () => {
 
   it("stays within narrow widths", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsModule.default(api);
 
     const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_status");
     assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
 
     const rendered = rendererEntry.renderer(
       {
+        role: "custom",
+        display: true,
+        timestamp: Date.now(),
         customType: "subagent_status",
         content: "Subagent status:\n• Worker running 5m, active (bash 2m).",
         details: { lines: ["Worker running 5m, active (bash 2m)."], overflow: 0 },
@@ -3023,6 +4845,7 @@ describe("subagent status renderer", () => {
       createTheme(),
     );
 
+    if (!rendered) throw new Error("Expected status renderer component");
     for (const width of [4, 5, 6]) {
       for (const line of rendered.render(width)) {
         assert.ok(
@@ -3036,7 +4859,7 @@ describe("subagent status renderer", () => {
 
 describe("subagent startup delay", () => {
   it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
@@ -3051,7 +4874,7 @@ describe("subagent startup delay", () => {
   });
 
   it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
@@ -3067,42 +4890,48 @@ describe("subagent startup delay", () => {
 });
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
 
     const originalNow = Date.now;
     Date.now = () => 1_000_000;
     try {
-      const lines = testApi.renderSubagentWidgetLines([
-        {
-          id: "a1",
-          name: "A",
-          task: "",
-          surface: "s1",
-          startTime: 1_000_000 - 13_000,
-          sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 13_000 }),
-        },
-        {
-          id: "a2",
-          name: "B",
-          task: "",
-          surface: "s2",
-          startTime: 1_000_000 - 21_000,
-          sessionFile: "sess2",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 21_000 }),
-        },
-        {
-          id: "a3",
-          name: "C",
-          task: "",
-          surface: "s3",
-          startTime: 1_000_000 - 27_000,
-          sessionFile: "sess3",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
-        },
-      ], 16);
+      const lines = testApi.renderSubagentWidgetLines(
+        [
+          {
+            id: "a1",
+            name: "A",
+            task: "",
+            surface: "s1",
+            startTime: 1_000_000 - 13_000,
+            sessionFile: "sess1",
+            statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 13_000 }),
+            interactive: false,
+          },
+          {
+            id: "a2",
+            name: "B",
+            task: "",
+            surface: "s2",
+            startTime: 1_000_000 - 21_000,
+            sessionFile: "sess2",
+            statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 21_000 }),
+            interactive: false,
+          },
+          {
+            id: "a3",
+            name: "C",
+            task: "",
+            surface: "s3",
+            startTime: 1_000_000 - 27_000,
+            sessionFile: "sess3",
+            statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
+            interactive: false,
+          },
+        ],
+        16,
+      );
 
       assert.deepEqual(
         lines.map((line: string) => visibleWidth(line)),
@@ -3114,27 +4943,33 @@ describe("subagents widget rendering", () => {
   });
 
   it("shows the model and its source in active-subagent status", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     const startTime = Date.now();
-    const lines = testApi.renderSubagentWidgetLines([{
-      id: "model-agent",
-      name: "scout",
-      task: "",
-      agent: "scout",
-      model: "anthropic/claude-test",
-      modelSource: "spawn override",
-      surface: "s1",
-      startTime,
-      sessionFile: "missing-session",
-      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
-    }], 100);
+    const lines = testApi.renderSubagentWidgetLines(
+      [
+        {
+          id: "model-agent",
+          name: "scout",
+          task: "",
+          agent: "scout",
+          model: "anthropic/claude-test",
+          modelSource: "spawn override",
+          surface: "s1",
+          startTime,
+          sessionFile: "missing-session",
+          statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+          interactive: false,
+        },
+      ],
+      100,
+    );
 
     assert.match(lines[1], /anthropic\/claude-test/);
     assert.match(lines[1], /spawn override/);
   });
 
   it("shows the model reported by a running session when available", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     withTempDir((dir) => {
       const sessionFile = createSessionFile(dir, [
         SESSION_HEADER,
@@ -3142,29 +4977,39 @@ describe("subagents widget rendering", () => {
           type: "message",
           id: "assistant-active",
           parentId: null,
-          message: { role: "assistant", model: "openai/runtime-model", content: [{ type: "text", text: "working" }] },
+          message: {
+            role: "assistant",
+            model: "openai/runtime-model",
+            content: [{ type: "text", text: "working" }],
+          },
         },
       ]);
       const startTime = Date.now();
-      const lines = testApi.renderSubagentWidgetLines([{
-        id: "model-agent",
-        name: "scout",
-        task: "",
-        agent: "scout",
-        model: null,
-        modelSource: "Pi default",
-        surface: "s1",
-        startTime,
-        sessionFile,
-        statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
-      }], 100);
+      const lines = testApi.renderSubagentWidgetLines(
+        [
+          {
+            id: "model-agent",
+            name: "scout",
+            task: "",
+            agent: "scout",
+            model: null,
+            modelSource: "Pi default",
+            surface: "s1",
+            startTime,
+            sessionFile,
+            statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+            interactive: false,
+          },
+        ],
+        100,
+      );
 
       assert.match(lines[1], /openai\/runtime-model \(Pi default\)/);
     });
   });
 
   it("truncates the right-hand status instead of overflowing when it alone is too wide", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.borderLine, "function");
 
@@ -3173,24 +5018,28 @@ describe("subagents widget rendering", () => {
   });
 
   it("handles ultra-narrow widths without exceeding the width contract", () => {
-    const testApi = (subagentsModule as any).__test__;
+    const testApi = testHelpers;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
 
     const widths = [0, 1, 2];
     for (const width of widths) {
       const startTime = Date.now() - 5_000;
-      const lines = testApi.renderSubagentWidgetLines([
-        {
-          id: "a1",
-          name: "A",
-          task: "",
-          surface: "s1",
-          startTime,
-          sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
-        },
-      ], width);
+      const lines = testApi.renderSubagentWidgetLines(
+        [
+          {
+            id: "a1",
+            name: "A",
+            task: "",
+            surface: "s1",
+            startTime,
+            sessionFile: "sess1",
+            statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+            interactive: false,
+          },
+        ],
+        width,
+      );
 
       for (const line of lines) {
         assert.ok(
@@ -3203,7 +5052,7 @@ describe("subagents widget rendering", () => {
 });
 
 describe("subagent display helpers", () => {
-  const testApi = (subagentsModule as any).__test__;
+  const testApi = testHelpers;
 
   describe("formatTokens", () => {
     it("renders raw counts below 1k, 1 decimal below 10k, rounded k above", () => {
@@ -3267,7 +5116,7 @@ describe("subagent display helpers", () => {
 
   describe("widgetIcon", () => {
     it("maps active/running to a glyph and waiting/starting to another", () => {
-      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+      const strip = (s: string) => s.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g"), "");
       assert.equal(strip(testApi.widgetIcon("active")), "⟳");
       assert.equal(strip(testApi.widgetIcon("running")), "⟳");
       assert.equal(strip(testApi.widgetIcon("stalled")), "⟳");

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test with coverage
+        run: npm run test:coverage
+
+      - name: No-auth loadout CLI tests
+        run: npm run test:loadout:cli
+
+      - name: Install Pi runtime for completion delivery tests
+        run: npm install --prefix "$RUNNER_TEMP/pi-runtime" --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.4.0
+
+      - name: No-auth completion delivery CLI tests
+        env:
+          PI_TEST_PI_EXECUTABLE: ${{ runner.temp }}/pi-runtime/node_modules/.bin/pi
+        run: npm run test:completion:cli

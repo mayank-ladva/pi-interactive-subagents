@@ -12,14 +12,26 @@
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+
+export function shouldBlockSubagentInputForLoadout(state: string | undefined, initialInputConsumed: boolean): boolean {
+  if (state === "validated" || state === "ready") return false;
+  return state !== "pending" || initialInputConsumed;
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
+}
+
+export function writeSubagentShutdownRequest(sessionFile: string, requestedAt = Date.now()): void {
+  const requestFile = `${sessionFile}.shutdown-request`;
+  const tempFile = `${requestFile}.${process.pid}.tmp`;
+  writeFileSync(tempFile, `${JSON.stringify({ requestedAt })}\n`, { mode: 0o600 });
+  renameSync(tempFile, requestFile);
 }
 
 /**
@@ -38,7 +50,7 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
  * standalone session), so those agents auto-exit exactly as before.
  */
 export function runningChildrenCount(): number {
-  const fn = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
+  const fn = (globalThis as Record<symbol, unknown>)[Symbol.for("pi-subagents/running-children-count")];
   if (typeof fn !== "function") return 0;
   try {
     const n = fn();
@@ -48,10 +60,17 @@ export function runningChildrenCount(): number {
   }
 }
 
-export function shouldAutoExitOnAgentEnd(
-  _userTookOver: boolean,
-  messages: any[] | undefined,
-): boolean {
+interface AssistantMessageSummary {
+  role?: string;
+  stopReason?: string;
+  errorMessage?: unknown;
+}
+
+function isAssistantMessageSummary(value: unknown): value is AssistantMessageSummary {
+  return typeof value === "object" && value !== null && "role" in value && value.role === "assistant";
+}
+
+export function shouldAutoExitOnAgentEnd(_userTookOver: boolean, messages: readonly unknown[] | undefined): boolean {
   // Manual input should not strand an auto-exit subagent. If the latest agent
   // turn completed normally, close the session. Escape/abort still leaves it
   // open for inspection or another prompt.
@@ -61,9 +80,8 @@ export function shouldAutoExitOnAgentEnd(
   // pair this with findLatestAssistantError() so the parent learns it was an
   // error, not a clean completion.
   if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant") {
+    for (const msg of messages.toReversed()) {
+      if (isAssistantMessageSummary(msg)) {
         return msg.stopReason !== "aborted";
       }
     }
@@ -86,13 +104,10 @@ export interface SubagentErrorInfo {
  * Returns `null` when the latest assistant turn completed normally or was
  * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
  */
-export function findLatestAssistantError(
-  messages: any[] | undefined,
-): SubagentErrorInfo | null {
+export function findLatestAssistantError(messages: readonly unknown[] | undefined): SubagentErrorInfo | null {
   if (!messages) return null;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.role !== "assistant") continue;
+  for (const msg of messages.toReversed()) {
+    if (!isAssistantMessageSummary(msg)) continue;
     if (msg.stopReason !== "error") return null;
     const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
     return {
@@ -110,7 +125,7 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI) {
+export default function subagentDone(pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -125,10 +140,10 @@ export default function (pi: ExtensionAPI) {
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
 
-  function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
+  function renderWidget(ctx: ExtensionContext) {
     ctx.ui.setWidget(
       "subagent-tools",
-      (_tui: any, theme: any) => {
+      (_tui, theme) => {
         const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
 
         const label = subagentAgent || subagentName;
@@ -139,31 +154,21 @@ export default function (pi: ExtensionAPI) {
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
           const hint = theme.fg("muted", "  (Ctrl+Alt+O to collapse)");
 
-          const toolList = toolNames
-            .map((name: string) => theme.fg("dim", name))
-            .join(theme.fg("muted", ", "));
+          const toolList = toolNames.map((name: string) => theme.fg("dim", name)).join(theme.fg("muted", ", "));
 
           let deniedLine = "";
           if (denied.length > 0) {
-            const deniedList = denied
-              .map((name: string) => theme.fg("error", name))
-              .join(theme.fg("muted", ", "));
-            deniedLine = "\n" + theme.fg("muted", "denied: ") + deniedList;
+            const deniedList = denied.map((name: string) => theme.fg("error", name)).join(theme.fg("muted", ", "));
+            deniedLine = `\n${theme.fg("muted", "denied: ")}${deniedList}`;
           }
 
-          const content = new Text(
-            `${agentTag}${countInfo}${hint}\n${toolList}${deniedLine}`,
-            0,
-            0,
-          );
+          const content = new Text(`${agentTag}${countInfo}${hint}\n${toolList}${deniedLine}`, 0, 0);
           box.addChild(content);
         } else {
           // Collapsed: one-line summary
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
           const deniedInfo =
-            denied.length > 0
-              ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
-              : "";
+            denied.length > 0 ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`) : "";
           const hint = theme.fg("muted", "  (Ctrl+Alt+O to expand)");
 
           const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
@@ -178,6 +183,7 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let initialInputConsumed = false;
   // Set when ask_question is called; suppresses auto-exit so the session stays
   // open while it waits for the orchestrator's reply. Cleared when the reply
   // lands — on `input` (covers a reply steered into the current run) and on
@@ -188,13 +194,32 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
     const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
+    toolNames = tools
+      .map((t) => t.name)
+      .toSorted((a, b) => {
+        if (a < b) return -1;
+        if (a > b) return 1;
+        return 0;
+      });
     denied = parseDeniedTools(deniedToolsValue);
 
-    renderWidget(ctx, null);
+    renderWidget(ctx);
   });
 
   pi.on("input", () => {
+    const readinessPath = process.env.PI_SUBAGENT_READY_FILE;
+    if (readinessPath) {
+      let state: string | undefined;
+      try {
+        state = readFileSync(readinessPath, "utf8");
+      } catch {
+        state = undefined;
+      }
+      if (shouldBlockSubagentInputForLoadout(state, initialInputConsumed)) {
+        return { action: "handled" as const };
+      }
+      if (state === "pending") initialInputConsumed = true;
+    }
     recorder.input();
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
@@ -224,7 +249,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
+    const messages = event.messages;
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
     //  - runningChildrenCount(): this subagent spawned its own children and is
@@ -234,10 +259,7 @@ export default function (pi: ExtensionAPI) {
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
     const shouldExit =
-      !awaitingAnswer &&
-      !hasPendingChildren &&
-      autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+      !awaitingAnswer && !hasPendingChildren && autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -264,6 +286,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       recorder.agentEndDone();
+      if (sessionFile) {
+        try {
+          writeSubagentShutdownRequest(sessionFile);
+        } catch {
+          // Shutdown remains best-effort even if the watcher signal cannot be persisted.
+        }
+      }
       ctx.shutdown();
       return;
     }
@@ -277,11 +306,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_start", (event) => {
-    recorder.turnStart((event as any).turnIndex);
+    recorder.turnStart(event.turnIndex);
   });
 
   pi.on("turn_end", (event) => {
-    recorder.turnEnd((event as any).turnIndex);
+    recorder.turnEnd(event.turnIndex);
   });
 
   pi.on("before_provider_request", () => {
@@ -293,31 +322,31 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_update", (event) => {
-    recorder.messageUpdate((event as any).assistantMessageEvent?.type);
+    recorder.messageUpdate(event.assistantMessageEvent?.type);
   });
 
   pi.on("tool_execution_start", (event) => {
-    recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
+    recorder.toolExecutionStart(event.toolCallId, event.toolName);
   });
 
   pi.on("tool_call", (event) => {
-    recorder.toolCall((event as any).toolCallId, (event as any).toolName);
+    recorder.toolCall(event.toolCallId, event.toolName);
   });
 
   pi.on("tool_execution_update", (event) => {
-    recorder.toolExecutionUpdate((event as any).toolCallId, (event as any).toolName);
+    recorder.toolExecutionUpdate(event.toolCallId, event.toolName);
   });
 
   pi.on("tool_result", (event) => {
-    recorder.toolResult((event as any).toolCallId, (event as any).toolName);
+    recorder.toolResult(event.toolCallId, event.toolName);
   });
 
   pi.on("tool_execution_end", (event) => {
-    recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
+    recorder.toolExecutionEnd(event.toolCallId, event.toolName);
   });
 
   pi.on("session_shutdown", (event) => {
-    recorder.sessionShutdown((event as any).reason);
+    recorder.sessionShutdown(event.reason);
   });
 
   // Toggle expand/collapse with Ctrl+Alt+O
@@ -325,7 +354,7 @@ export default function (pi: ExtensionAPI) {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;
-      renderWidget(ctx, null);
+      renderWidget(ctx);
     },
   });
 
@@ -354,7 +383,7 @@ export default function (pi: ExtensionAPI) {
           "The single freeform question to ask the orchestrator. Include enough context to answer it directly.",
       }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
         throw new Error(
@@ -389,11 +418,11 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
+      const question = (args as { question?: unknown }).question;
       const text =
         theme.fg("toolTitle", theme.bold("ask_question ")) +
-        theme.fg("muted", String((args as any).question ?? ""));
+        theme.fg("muted", typeof question === "string" ? question : "");
       return new Text(text, 0, 0);
     },
   });
-
 }

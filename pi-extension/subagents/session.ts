@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
@@ -14,6 +15,7 @@ import {
 } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import type { ChildOnlyExtension, ExplicitSubagentLoadout } from "./loadout.ts";
 
 export interface SessionEntry {
   type: string;
@@ -72,8 +74,7 @@ export function seedSubagentSessionFile(params: {
     cwd: params.childCwd,
     parentSession: params.parentSessionFile,
   };
-  const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+  const contentLines = params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
@@ -86,14 +87,19 @@ export function seedSubagentSessionFile(params: {
  *
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
- * same `--no-extensions` + `--tools` restriction, model, identity, spawn
+ * same selected extensions, provider-bound tool grants, model, identity, spawn
  * whitelist, cwd, and config dir it originally ran with — instead of falling
- * back to pi's default (all global extensions + full toolset). Storing the
+ * back to Pi's default (all global extensions + full toolset). Strict snapshots
+ * also pin the Pi runtime version and selected extension identities. Storing the
  * resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
  */
 export interface SubagentLoadout {
+  /** Present only when the profile opted into strict, explicit loading. */
+  explicitLoadout?: ExplicitSubagentLoadout;
+  /** Explicit child-only extension files, pinned by content fingerprint. */
+  subagentOnlyExtensions?: ChildOnlyExtension[];
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
@@ -125,11 +131,15 @@ export function loadoutSidecarPath(sessionFile: string): string {
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
+  const path = loadoutSidecarPath(sessionFile);
   try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
-  } catch {
-    // Best-effort: a missing snapshot only means resume will refuse, never that
-    // it launches unrestricted.
+    writeFileSync(path, JSON.stringify(loadout), { encoding: "utf8", mode: 0o600 });
+    chmodSync(path, 0o600);
+  } catch (error) {
+    if (loadout.explicitLoadout) {
+      throw new Error(`Could not persist explicit subagent loadout safely: ${String(error)}`);
+    }
+    // Best-effort for legacy snapshots: a missing snapshot means resume refuses.
   }
 }
 
@@ -187,17 +197,13 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
  * Writes atomically (temp file + rename) so a concurrent reader never sees a
  * partial registry.
  */
-export function registerName(
-  artifactDir: string,
-  name: string,
-  entry: NameRegistryEntry,
-): void {
+export function registerName(artifactDir: string, name: string, entry: NameRegistryEntry): void {
   try {
     mkdirSync(artifactDir, { recursive: true });
     const registry = readNameRegistry(artifactDir);
     registry[name] = entry;
     const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+    const tmp = `${p}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
     writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
     renameSync(tmp, p);
   } catch {
@@ -207,10 +213,7 @@ export function registerName(
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */
-export function resolveNameInRegistry(
-  artifactDir: string,
-  name: string,
-): NameRegistryEntry | null {
+export function resolveNameInRegistry(artifactDir: string, name: string): NameRegistryEntry | null {
   const entry = readNameRegistry(artifactDir)[name];
   return entry && typeof entry.sessionFile === "string" ? entry : null;
 }
@@ -228,7 +231,7 @@ function readEntries(sessionFile: string): SessionEntry[] {
  */
 export function getLeafId(sessionFile: string): string | null {
   const entries = readEntries(sessionFile);
-  return entries.length > 0 ? entries[entries.length - 1].id : null;
+  return entries.at(-1)?.id ?? null;
 }
 
 /**
@@ -333,8 +336,24 @@ function topLevelSignature(root: string): string {
       parts.push(`f:${e.name}`);
     }
   }
-  parts.sort();
+  parts.sort((a, b) => a.localeCompare(b));
   return parts.join("|");
+}
+
+function indexSessionFile(full: string, idx: SessionIndex): void {
+  let mtime: number;
+  try {
+    mtime = statSync(full).mtimeMs;
+  } catch {
+    return;
+  }
+  const known = idx.files.get(full);
+  if (known !== undefined && known === mtime) return;
+  const id = readHeaderId(full);
+  idx.files.set(full, mtime);
+  if (!id) return;
+  const prev = idx.idToFile.get(id);
+  if (!prev || mtime >= prev.mtime) idx.idToFile.set(id, { path: full, mtime });
 }
 
 /** Recursively index new/changed .jsonl files under dir into idx. */
@@ -350,21 +369,7 @@ function indexDir(dir: string, idx: SessionIndex): void {
     if (entry.isDirectory()) {
       indexDir(full, idx);
     } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-      let mtime = 0;
-      try {
-        mtime = statSync(full).mtimeMs;
-      } catch {
-        continue;
-      }
-      const known = idx.files.get(full);
-      if (known !== undefined && known === mtime) continue; // unchanged
-      const id = readHeaderId(full); // only read headers for new/changed files
-      idx.files.set(full, mtime);
-      if (!id) continue;
-      const prev = idx.idToFile.get(id);
-      if (!prev || mtime >= prev.mtime) {
-        idx.idToFile.set(id, { path: full, mtime });
-      }
+      indexSessionFile(full, idx);
     }
   }
 }
@@ -418,10 +423,7 @@ function lookupSessionIndex(
  * keeps the event loop responsive. The heavy work only happens on the first
  * resolution per process (and incrementally thereafter); warm lookups are ~50ms.
  */
-export async function resolveSessionFileByIdAsync(
-  sessionId: string,
-  sessionsRoot: string,
-): Promise<string | null> {
+export async function resolveSessionFileByIdAsync(sessionId: string, sessionsRoot: string): Promise<string | null> {
   if (!sessionId || !existsSync(sessionsRoot)) return null;
   // Let the event loop breathe (and the UI repaint) before the sync scan.
   await new Promise<void>((r) => setImmediate(r));
@@ -481,21 +483,14 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
     if (msg.message.role !== "assistant") continue;
 
     const texts = msg.message.content
-      .filter(
-        (block) =>
-          block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
-      )
+      .filter((block) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
       .map((block) => block.text as string);
 
     if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
 
     const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
     const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
-    if (
-      stopReason === "error" &&
-      typeof errorMessage === "string" &&
-      errorMessage.trim() !== ""
-    ) {
+    if (stopReason === "error" && typeof errorMessage === "string" && errorMessage.trim() !== "") {
       return `Subagent error: ${errorMessage.trim()}`;
     }
   }
@@ -540,11 +535,7 @@ export function copySessionFile(sessionFile: string, destDir: string): string {
  * Read new entries from sourceFile (after afterLine), append them to targetFile.
  * Returns the appended entries.
  */
-export function mergeNewEntries(
-  sourceFile: string,
-  targetFile: string,
-  afterLine: number,
-): SessionEntry[] {
+export function mergeNewEntries(sourceFile: string, targetFile: string, afterLine: number): SessionEntry[] {
   const entries = getNewEntries(sourceFile, afterLine);
   for (const entry of entries) {
     appendFileSync(targetFile, JSON.stringify(entry) + "\n", "utf8");
@@ -573,15 +564,8 @@ export interface SessionStats {
  * context size is taken from the last assistant turn's `totalTokens` (the live
  * context window occupancy). Returns null if the file can't be read.
  */
-export function summarizeSessionStats(sessionFile: string): SessionStats | null {
-  let entries: SessionEntry[];
-  try {
-    entries = readEntries(sessionFile);
-  } catch {
-    return null;
-  }
-
-  const stats: SessionStats = {
+function emptySessionStats(): SessionStats {
+  return {
     model: null,
     toolCount: 0,
     inputTokens: 0,
@@ -591,7 +575,40 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
     contextTokens: 0,
     cost: 0,
   };
+}
 
+function numericUsage(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function accumulateAssistantStats(stats: SessionStats, msg: MessageEntry["message"]): void {
+  const model = (msg as { model?: unknown }).model;
+  if (typeof model === "string" && model) stats.model = model;
+  for (const block of msg.content) {
+    if (block.type === "toolCall") stats.toolCount++;
+  }
+
+  const usage = (msg as { usage?: Record<string, unknown> }).usage;
+  if (!usage || typeof usage !== "object") return;
+  stats.inputTokens += numericUsage(usage.input);
+  stats.outputTokens += numericUsage(usage.output);
+  stats.cacheReadTokens += numericUsage(usage.cacheRead);
+  stats.cacheWriteTokens += numericUsage(usage.cacheWrite);
+  const total = numericUsage(usage.totalTokens);
+  if (total > 0) stats.contextTokens = total;
+  const cost = usage.cost;
+  if (cost && typeof cost === "object") stats.cost += numericUsage((cost as Record<string, unknown>).total);
+}
+
+export function summarizeSessionStats(sessionFile: string): SessionStats | null {
+  let entries: SessionEntry[];
+  try {
+    entries = readEntries(sessionFile);
+  } catch {
+    return null;
+  }
+
+  const stats = emptySessionStats();
   for (const entry of entries) {
     if (entry.type === "model_change") {
       const modelId = (entry as { modelId?: unknown }).modelId;
@@ -600,27 +617,7 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
     }
     if (entry.type !== "message") continue;
     const msg = (entry as MessageEntry).message;
-    if (msg.role !== "assistant") continue;
-
-    const model = (msg as { model?: unknown }).model;
-    if (typeof model === "string" && model) stats.model = model;
-
-    for (const block of msg.content) {
-      if (block.type === "toolCall") stats.toolCount++;
-    }
-
-    const usage = (msg as { usage?: Record<string, unknown> }).usage;
-    if (usage && typeof usage === "object") {
-      const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-      stats.inputTokens += num(usage.input);
-      stats.outputTokens += num(usage.output);
-      stats.cacheReadTokens += num(usage.cacheRead);
-      stats.cacheWriteTokens += num(usage.cacheWrite);
-      const total = num(usage.totalTokens);
-      if (total > 0) stats.contextTokens = total;
-      const cost = usage.cost;
-      if (cost && typeof cost === "object") stats.cost += num((cost as Record<string, unknown>).total);
-    }
+    if (msg.role === "assistant") accumulateAssistantStats(stats, msg);
   }
 
   return stats;

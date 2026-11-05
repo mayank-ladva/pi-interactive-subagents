@@ -1,36 +1,47 @@
 /**
- * Shared pane API for tmux and Herdr (historical filename kept for callers).
- * A nested tmux session takes precedence; otherwise a Herdr-managed Pi uses
- * native Herdr panes. All operations target explicit panes, never UI focus.
+ * Shared tmux/Herdr pane API. Terminal operations are backend-specific;
+ * exit sidecars and shutdown handling follow the upstream implementation.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 import * as herdr from "./herdr.ts";
 
 const execFileAsync = promisify(execFile);
 
 // ── Availability ──
 
-const commandAvailability = new Map<string, boolean>();
+const commandPaths = new Map<string, string | null>();
+
+function resolveCommand(command: string): string | undefined {
+  if (commandPaths.has(command)) return commandPaths.get(command) ?? undefined;
+
+  const executable = (process.env.PATH ?? "")
+    .split(":")
+    .map((directory) => resolve(directory || process.cwd(), command))
+    .find((path) => {
+      try {
+        accessSync(path, constants.X_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  commandPaths.set(command, executable ?? null);
+  return executable;
+}
 
 function hasCommand(command: string): boolean {
-  if (commandAvailability.has(command)) {
-    return commandAvailability.get(command)!;
-  }
+  return resolveCommand(command) !== undefined;
+}
 
-  let available = false;
-  try {
-    execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
-    available = true;
-  } catch {
-    available = false;
-  }
-
-  commandAvailability.set(command, available);
-  return available;
+function tmuxExecutable(): string {
+  const executable = resolveCommand("tmux");
+  if (!executable) throw new Error(`tmux is required for subagents. ${muxSetupHint()}`);
+  return executable;
 }
 
 /**
@@ -64,7 +75,8 @@ function requireTmux(): void {
 // ── Shell helpers ──
 
 export function shellEscape(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
+  const escapedQuote = String.raw`'\''`;
+  return `'${s.replaceAll("'", escapedQuote)}'`;
 }
 
 // ── Pane layout ──
@@ -95,7 +107,7 @@ function rebalanceSurfaces(hintPane?: string): void {
     rebalanceTimer = null;
     try {
       // -t <pane> resolves to that pane's window; does not change focus.
-      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
+      execFileSync(tmuxExecutable(), ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
         encoding: "utf8",
       });
     } catch {
@@ -107,26 +119,29 @@ function rebalanceSurfaces(hintPane?: string): void {
 // ── Surface primitives ──
 
 /**
- * Create a child without changing focus: a managed row below Pi in Herdr,
- * or a right split off the parent pane in tmux. Returns a native pane ID.
+ * Create a new pane for a subagent: a right split off the parent pi's pane,
+ * so new panes follow the agent rather than the user's focus.
+ * See https://github.com/HazAT/pi-interactive-subagents/issues/12
+ *
+ * Returns the new pane id (e.g. `%12`).
  */
 export function createSurface(name: string): string {
   if (getMuxBackend() === "herdr") return herdr.createSurface(name);
-  void name; // tmux panes are not named; the pi process inside shows its own title.
+  // tmux panes are not named; the pi process inside shows its own title.
   return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
 }
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Herdr supports right/down; tmux supports all four directions.
+ * Returns the new pane id (e.g. `%12`).
  */
 export function createSurfaceSplit(
-  name: string,
+  _name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  if (getMuxBackend() === "herdr") return herdr.createSurfaceSplit(name, direction, fromSurface);
-  void name;
+  if (getMuxBackend() === "herdr") return herdr.createSurfaceSplit(_name, direction, fromSurface);
+  // tmux panes are not named; retain the argument for API compatibility.
   requireTmux();
 
   const args = ["split-window", "-d"];
@@ -143,7 +158,7 @@ export function createSurfaceSplit(
   }
   args.push("-P", "-F", "#{pane_id}");
 
-  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
+  const pane = execFileSync(tmuxExecutable(), args, { encoding: "utf8" }).trim();
   if (!pane.startsWith("%")) {
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
   }
@@ -154,19 +169,25 @@ export function createSurfaceSplit(
 
 /**
  * Send a command string to a pane and execute it.
- * Herdr submits atomically via pane run; tmux types literally (`-l`) then
- * submits Enter so special characters are not interpreted as keys.
+ * Typed literally (`-l`) so special characters are not interpreted as keys,
+ * then submitted with Enter.
  */
 export function sendCommand(surface: string, command: string): void {
-  if (getMuxBackend() === "herdr") return herdr.sendCommand(surface, command);
+  if (getMuxBackend() === "herdr") {
+    herdr.sendCommand(surface, command);
+    return;
+  }
   requireTmux();
-  execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
-  execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
+  execFileSync(tmuxExecutable(), ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
+  execFileSync(tmuxExecutable(), ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
 
-/** Submit a follow-up to a live agent rather than to its shell. */
+/** Submit a follow-up through Herdr's agent API, or the tmux terminal. */
 export function sendMessage(surface: string, message: string): void {
-  if (getMuxBackend() === "herdr") return herdr.sendMessage(surface, message);
+  if (getMuxBackend() === "herdr") {
+    herdr.sendMessage(surface, message);
+    return;
+  }
   sendCommand(surface, message);
 }
 
@@ -187,12 +208,7 @@ export function sendLongCommand(
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
   const scriptPath =
-    options?.scriptPath ??
-    join(
-      tmpdir(),
-      "pi-subagent-scripts",
-      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-    );
+    options?.scriptPath ?? join(tmpdir(), "pi-subagent-scripts", `cmd-${randomBytes(8).toString("hex")}.sh`);
   mkdirSync(dirname(scriptPath), { recursive: true });
 
   const scriptParts = ["#!/bin/bash"];
@@ -201,7 +217,7 @@ export function sendLongCommand(
   }
   scriptParts.push(command);
 
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
+  writeFileSync(scriptPath, `${scriptParts.join("\n")}\n`, {
     mode: 0o755,
   });
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
@@ -214,13 +230,9 @@ export function sendLongCommand(
 export function readScreen(surface: string, lines = 50): string {
   if (getMuxBackend() === "herdr") return herdr.readScreen(surface, lines);
   requireTmux();
-  return execFileSync(
-    "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-    {
-      encoding: "utf8",
-    },
-  );
+  return execFileSync(tmuxExecutable(), ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`], {
+    encoding: "utf8",
+  });
 }
 
 /**
@@ -230,7 +242,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   if (getMuxBackend() === "herdr") return herdr.readScreenAsync(surface, lines);
   requireTmux();
   const { stdout } = await execFileAsync(
-    "tmux",
+    tmuxExecutable(),
     ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     { encoding: "utf8" },
   );
@@ -241,9 +253,12 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
-  if (getMuxBackend() === "herdr") return herdr.closeSurface(surface);
+  if (getMuxBackend() === "herdr") {
+    herdr.closeSurface(surface);
+    return;
+  }
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  execFileSync(tmuxExecutable(), ["kill-pane", "-t", surface], { encoding: "utf8" });
   rebalanceSurfaces();
 }
 
@@ -252,25 +267,29 @@ export function closeSurface(surface: string): void {
 export interface PollResult {
   /** How the subagent exited */
   reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  /** Child process exit code. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
+  /** Non-provider watcher failure that must not trigger configured model fallback. */
+  error?: string;
+  shutdownRequestedAt?: number;
+  shutdownElapsedMs?: number;
 }
 
 /**
  * Interpret an `.exit` sidecar payload (written by the error path in
  * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
+ * pollForExit decode the payload the same way. Clean completions do not write
+ * this provider-error sidecar; ordinary completion uses a separate durable process-exit sidecar.
  *
  * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
  * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
  */
-function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "error") {
+function interpretExitSidecar(data: unknown): PollResult {
+  if (typeof data === "object" && data !== null && "type" in data && data.type === "error") {
     const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
+      "errorMessage" in data && typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
         ? data.errorMessage
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
@@ -278,19 +297,136 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+export const __pollForExitTest__ = { interpretExitSidecar, readProcessExitSidecar, checkShutdownRequestTimeout };
 
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
+ * Poll until the subagent exits. Checks provider-error and process-exit
+ * sidecars first, using the terminal sentinel as a compatibility fallback.
  */
+function readExitSidecar(sessionFile?: string): PollResult | undefined {
+  if (!sessionFile) return undefined;
+  try {
+    const exitFile = `${sessionFile}.exit`;
+    if (!existsSync(exitFile)) return undefined;
+    const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+    rmSync(exitFile, { force: true });
+    return interpretExitSidecar(data);
+  } catch {
+    return undefined;
+  }
+}
+
+function checkShutdownRequestTimeout(
+  requestFile: string | undefined,
+  timeoutMs: number | undefined,
+  now = Date.now(),
+  processExitFile?: string,
+): PollResult | undefined {
+  if (!requestFile || timeoutMs == null) return undefined;
+  try {
+    const request = JSON.parse(readFileSync(requestFile, "utf-8"));
+    if (typeof request?.requestedAt !== "number" || !Number.isFinite(request.requestedAt)) return undefined;
+    if (now - request.requestedAt < timeoutMs) return undefined;
+    return (
+      readProcessExitSidecar(processExitFile) ?? {
+        reason: "error",
+        exitCode: 124,
+        error: "shutdown-timeout",
+        shutdownRequestedAt: request.requestedAt,
+        shutdownElapsedMs: now - request.requestedAt,
+      }
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function readProcessExitSidecar(processExitFile?: string): PollResult | undefined {
+  if (!processExitFile) return undefined;
+  try {
+    const data = JSON.parse(readFileSync(processExitFile, "utf-8"));
+    if (typeof data !== "object" || data === null || data.type !== "process_exit") return undefined;
+    if (!Number.isInteger(data.exitCode)) return undefined;
+    return { reason: "sentinel", exitCode: data.exitCode };
+  } catch {
+    return undefined;
+  }
+}
+
+async function waitForPollInterval(signal: AbortSignal, interval: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new Error("Aborted"));
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, interval);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(new Error("Aborted"));
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function checkSentinelFile(sentinelFile?: string): PollResult | undefined {
+  if (!sentinelFile) return undefined;
+  try {
+    if (existsSync(sentinelFile)) return { reason: "sentinel", exitCode: 0 };
+  } catch {
+    // A missing or inaccessible sentinel is not an exit signal.
+  }
+  return undefined;
+}
+
+function parseTerminalSentinel(screen: string): PollResult | undefined {
+  const match = /__SUBAGENT_DONE_(\d+)__/.exec(screen);
+  return match ? { reason: "sentinel", exitCode: Number.parseInt(match[1], 10) } : undefined;
+}
+
+async function checkTerminalExit(surface: string, sessionFile?: string): Promise<PollResult | undefined> {
+  try {
+    return parseTerminalSentinel(await readScreenAsync(surface, 5));
+  } catch {
+    // Surface may have been destroyed — check if .exit file appeared in the meantime.
+    return readExitSidecar(sessionFile);
+  }
+}
+
+async function checkPollExit(
+  surface: string,
+  options: {
+    sessionFile?: string;
+    processExitFile?: string;
+    shutdownRequestFile?: string;
+    shutdownTimeoutMs?: number;
+    now?: () => number;
+    sentinelFile?: string;
+  },
+): Promise<PollResult | undefined> {
+  return (
+    readExitSidecar(options.sessionFile) ??
+    readProcessExitSidecar(options.processExitFile) ??
+    checkShutdownRequestTimeout(
+      options.shutdownRequestFile,
+      options.shutdownTimeoutMs,
+      options.now?.() ?? Date.now(),
+      options.processExitFile,
+    ) ??
+    checkSentinelFile(options.sentinelFile) ??
+    (await checkTerminalExit(surface, options.sessionFile))
+  );
+}
+
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
   options: {
     interval: number;
     sessionFile?: string;
+    processExitFile?: string;
+    shutdownRequestFile?: string;
+    shutdownTimeoutMs?: number;
+    now?: () => number;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
   },
@@ -302,62 +438,13 @@ export async function pollForExit(
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
-    try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
-    }
+    const result = await checkPollExit(surface, options);
+    if (result) return result;
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
     options.onTick?.(elapsed);
 
-    await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
+    // Polling is inherently sequential: each check follows the prior interval.
+    await waitForPollInterval(signal, options.interval); // NOSONAR
   }
 }

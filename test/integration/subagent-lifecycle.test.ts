@@ -1,24 +1,22 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a tmux or Herdr pane, runs pi with a task that uses the subagent
+ * These tests spawn REAL pi sessions with REAL LLM calls (OpenAI Codex GPT-6 Luna by default).
+ * Each test creates a tmux pane, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
- * Duration: ~30-90s per test.
+ * Duration: ~30-90s per test; provider credentials are required locally.
  *
- * Run inside Herdr or tmux:
- *   npm run test:integration
+ * Run inside tmux:
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: openai-codex/gpt-6-luna)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -38,8 +36,8 @@ import {
 const backends = getAvailableBackends();
 
 if (backends.length === 0) {
-  console.log("⚠️  Herdr/tmux is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside Herdr or tmux to enable these tests.");
+  console.log("⚠️  tmux is not available — skipping subagent lifecycle integration tests");
+  console.log("   Run inside tmux to enable these tests.");
 }
 
 for (const backend of backends) {
@@ -77,17 +75,10 @@ for (const backend of backends) {
 
       // Verify: subagent created the marker file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
-      assert.ok(
-        content.includes(`PASS_${id}`),
-        `Marker file should contain PASS_${id}. Got: ${content.trim()}`,
-      );
+      assert.ok(content.includes(`PASS_${id}`), `Marker file should contain PASS_${id}. Got: ${content.trim()}`);
 
       // Verify: outer pi received the subagent result
-      const screen = await waitForScreen(
-        surface,
-        /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i,
-        PI_TIMEOUT,
-      );
+      const screen = await waitForScreen(surface, /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i, PI_TIMEOUT);
 
       // Verify: session file was created (shown in steer result)
       const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
@@ -200,11 +191,11 @@ for (const backend of backends) {
       await sleep(1000);
 
       const task = [
-        `Call the subagent tool with these EXACT parameters:`,
+        `Call the subagent tool with these parameters:`,
+        `  agent: "test-fork"`,
         `  name: "Fork-${id}"`,
-        `  fork: true`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
+        `The test-fork agent profile selects fork session mode; do not pass a fork argument.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
@@ -215,11 +206,7 @@ for (const backend of backends) {
       assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
 
       // Wait for the outer pi to show the result
-      const screen = await waitForScreen(
-        surface,
-        /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
-        PI_TIMEOUT,
-      );
+      const screen = await waitForScreen(surface, /FORK_COMPLETE|completed|Sub-agent.*"Fork/i, PI_TIMEOUT);
 
       // Verify: the forked session has a parent link
       const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
@@ -259,16 +246,9 @@ for (const backend of backends) {
 
       // The test-ping agent calls caller_ping, which steers a "needs help" message
       // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
+      const screen = await waitForScreen(surface, /needs help|PING|caller_ping|ping/i, PI_TIMEOUT);
 
-      assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
-      );
+      assert.ok(/needs help|PING/i.test(screen), `Screen should show ping notification. Got:\n${screen.slice(-800)}`);
     });
 
     // ── Agent discovery ──
