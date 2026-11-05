@@ -22,7 +22,7 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
-  sendCommand,
+  sendMessage,
   sendLongCommand,
   pollForExit,
   closeSurface,
@@ -247,6 +247,19 @@ function getToolExtensionPath(tool: string): string | undefined {
   const builtin = map[tool];
   if (builtin && existsSync(builtin)) return builtin;
   return EXTRA_TOOL_EXTENSIONS.get(tool);
+}
+
+/** Resolve the installed provider needed when a restricted child disables discovery. */
+function getModelExtensionPath(model: string | null | undefined): string | undefined {
+  if (!model?.startsWith("kilocode/")) return undefined;
+  const roots = [getAgentConfigDir(), join(homedir(), ".pi", "agent")];
+  const extension = roots
+    .map((root) => join(root, "npm", "node_modules", "pi-kilocode", "src", "index.ts"))
+    .find((path) => existsSync(path));
+  if (!extension) {
+    throw new Error("Kilo models require the provider extension. Install it with: pi install npm:pi-kilocode");
+  }
+  return extension;
 }
 
 /**
@@ -803,10 +816,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require Herdr or tmux. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "Herdr or tmux not available" },
   };
 }
 
@@ -1156,7 +1169,7 @@ function buildSubagentToolAllowlist(
 /**
  * Apply a loadout snapshot's sandbox to a pi command's `parts` array: model and
  * thinking level, identity (system prompt), and the default-deny tool/extension restriction
- * (`--no-extensions` + `--tools` + one `-e` per tool-backing extension).
+ * (`--no-extensions` + `--tools` + explicit provider/tool extensions).
  *
  * This is the single source of truth for reconstructing a subagent's sandbox,
  * used both by the initial `launchSubagent` and by the `subagent_message`
@@ -1199,6 +1212,8 @@ function applySandboxToParts(
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
     const extPaths = new Set<string>();
+    const modelExtension = getModelExtensionPath(loadout.model);
+    if (modelExtension) extPaths.add(modelExtension);
     for (const tool of loadout.toolAllowlist.split(",")) {
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
@@ -1333,7 +1348,7 @@ function resolveRunningByName(name: string):
 function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => void = sendMessage,
 ): { ok: true } | { error: string } {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
@@ -1342,7 +1357,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via its pane: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1350,7 +1365,7 @@ function steerSubagent(
 
 function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => void = sendMessage,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1521,6 +1536,7 @@ async function launchSubagent(
   const fallbackModel = agentDefs?.cli === "claude"
     ? undefined
     : resolveFallbackModel(agentDefs?.fallbackModel, ctx.model, effectiveModel);
+  getModelExtensionPath(effectiveModel); // Fail before creating a pane if the provider is missing.
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = params.thinking !== undefined ? params.thinking : agentDefs?.thinking ?? null;
@@ -2548,6 +2564,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
+        getModelExtensionPath(loadout.model);
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 

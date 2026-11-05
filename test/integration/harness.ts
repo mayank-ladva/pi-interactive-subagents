@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux is available
+ * - Detect whether tmux or Herdr is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
+ * - Start real pi sessions in multiplexer panes
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -23,7 +23,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  isMuxAvailable,
+  getMuxBackend,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -34,7 +34,7 @@ import {
   shellEscape,
 } from "../../pi-extension/subagents/tmux.ts";
 
-// Re-export tmux primitives for tests
+// Re-export shared pane primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -75,12 +75,10 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
- */
+/** Return the backend used by the extension in the current environment. */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  const backend = getMuxBackend();
+  return backend ? [backend] : [];
 }
 
 export function focusSurface(surface: string): void {

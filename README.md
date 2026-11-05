@@ -1,12 +1,12 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in native Herdr or tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**Herdr + tmux fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus. In Herdr, the first child opens below Pi and the next beside it when there is room; further children split the largest child pane according to its shape. Existing user panes are never reused. In tmux, children open as right splits off the parent Pi pane. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+In tmux, panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -29,7 +29,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a dedicated Herdr or tmux pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -79,11 +79,15 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | `kilocode/nvidia/nemotron-3-ultra-550b-a55b:free` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). They also set `fallback-model: pi-default`: if the configured model ends with a provider/agent error, the extension retries once with the parent session's currently selected model.
+
+The bundled model uses **Kilo's free Nemotron 3 Ultra endpoint**. Install its provider once with `pi install npm:pi-kilocode`. Free models support anonymous access; no Z.ai key or credits are required. Restricted subagents explicitly load this provider from the standard Pi npm installation while keeping extension discovery disabled; the same sandbox helper is used on resume. Global or project-local profiles override the bundled defaults, so update their `model:` fields too if present.
+
+**Privacy and availability:** this NVIDIA endpoint is for trial use, is rate-limited, and logs requests under its provider terms. Do not send secrets, personal information, or confidential code. Free pricing and availability can change. The Pi-default fallback may use a paid or subscription-backed model.
 
 ## Custom agents
 
@@ -93,7 +97,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 ---
 name: my-agent
 description: Does something specific
-model: openrouter/z-ai/glm-5.3
+model: kilocode/nvidia/nemotron-3-ultra-550b-a55b:free
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
@@ -182,11 +186,28 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- Either [Herdr](https://herdr.dev) or [tmux](https://github.com/tmux/tmux)
+
+In Herdr, start `pi` in a Herdr-managed pane. No nested tmux is needed. The extension detects `HERDR_ENV=1` and `HERDR_PANE_ID`, and requires the `herdr` CLI on PATH. When Pi runs inside tmux (even within Herdr), tmux takes precedence.
+
+For tmux:
 
 ```bash
 tmux new -A -s pi 'pi'
 ```
+
+Subagent panes close automatically when the existing completion watcher finishes. Herdr operations always target explicit pane IDs and preserve the caller's working directory.
+
+### Development checks
+
+```bash
+npm install
+npm test
+npm run test:panes          # model-free pane checks; run inside Herdr or tmux
+npm run test:integration    # also runs real model-backed lifecycle tests
+```
+
+Lifecycle tests require working model authentication (API key or saved Pi login); `PI_TEST_MODEL` overrides their default `anthropic/claude-haiku-4-5` model. Pane checks make no model calls. To try this working-tree extension without loading an installed copy, run `pi -ne -e ./pi-extension/subagents/index.ts` from this directory.
 
 ## Acknowledgements
 
