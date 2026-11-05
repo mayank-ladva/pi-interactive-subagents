@@ -2,7 +2,7 @@
 name: scout
 description: Fast codebase recon — explores files, finds patterns, maps architecture
 tools: read, grep, find, ls
-model: openrouter/z-ai/glm-5.3
+model: kilocode/nvidia/nemotron-3-ultra-550b-a55b:free
 fallback-model: pi-default
 thinking: low
 system-prompt: append

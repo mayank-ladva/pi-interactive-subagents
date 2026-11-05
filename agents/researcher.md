@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
 tools: web_search, web_fetch, safe_bash
-model: openrouter/z-ai/glm-5.3
+model: kilocode/nvidia/nemotron-3-ultra-550b-a55b:free
 fallback-model: pi-default
 thinking: medium
 system-prompt: append

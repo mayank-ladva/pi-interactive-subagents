@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -1409,6 +1409,73 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+    });
+  });
+
+  it("applySandboxToParts loads Kilo for restricted launches and snapshot resumes", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const previousHome = process.env.HOME;
+      process.env.HOME = join(projectDir, "home");
+      const provider = join(globalDir, "npm", "node_modules", "pi-kilocode", "src", "index.ts");
+      mkdirSync(dirname(provider), { recursive: true });
+      writeFileSync(provider, "export default function () {}\n");
+      const loadout: SubagentLoadout = {
+        agent: "scout", toolAllowlist: "read,ask_question",
+        model: "kilocode/nvidia/nemotron-3-ultra-550b-a55b:free", thinking: "low",
+        identity: null, systemPromptMode: null, spawnable: null,
+        autoExit: true, cwd: null, agentDir: globalDir,
+      };
+      const options = { artifactDir: projectDir, name: "scout" };
+      try {
+        const initial: string[] = [];
+        testApi.applySandboxToParts(initial, loadout, options);
+        assert.deepEqual(initial, [
+          "--model", shellEscape(`${loadout.model}:low`),
+          "--no-extensions", "--tools", "'read,ask_question'", "-e", shellEscape(provider),
+        ]);
+        const sessionFile = join(projectDir, "child.jsonl");
+        writeSubagentLoadout(sessionFile, loadout);
+        const resumed: string[] = [];
+        testApi.applySandboxToParts(resumed, readSubagentLoadout(sessionFile)!, options);
+        assert.deepEqual(resumed, initial);
+
+        // Role-local agent dirs still find the standard global provider install.
+        const homeProvider = join(process.env.HOME, ".pi", "agent", "npm", "node_modules", "pi-kilocode", "src", "index.ts");
+        mkdirSync(dirname(homeProvider), { recursive: true });
+        writeFileSync(homeProvider, "export default function () {}\n");
+        process.env.PI_CODING_AGENT_DIR = join(projectDir, "role-agent-dir");
+        const nested: string[] = [];
+        testApi.applySandboxToParts(nested, loadout, options);
+        assert.equal(nested[nested.indexOf("-e") + 1], shellEscape(homeProvider));
+        assert.ok(nested.includes("--no-extensions"));
+
+        const native: string[] = [];
+        testApi.applySandboxToParts(native, { ...loadout, model: "zai/glm-5.3" }, options);
+        assert.ok(!native.includes("-e"), "native providers do not load Kilo");
+        assert.ok(native.includes("--no-extensions"));
+      } finally {
+        restoreEnvVar("HOME", previousHome);
+      }
+    });
+  });
+
+  it("applySandboxToParts reports a missing Kilo provider without enabling discovery", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir }) => {
+      const previousHome = process.env.HOME;
+      process.env.HOME = join(projectDir, "empty-home");
+      const parts: string[] = [];
+      try {
+        assert.throws(() => testApi.applySandboxToParts(parts, {
+          agent: "scout", toolAllowlist: "read",
+          model: "kilocode/nvidia/nemotron-3-ultra-550b-a55b:free", thinking: null,
+          identity: null, systemPromptMode: null, spawnable: null,
+          autoExit: true, cwd: null, agentDir: null,
+        }, { artifactDir: projectDir, name: "scout" }), /pi install npm:pi-kilocode/);
+        assert.ok(parts.includes("--no-extensions"));
+        assert.ok(parts.includes("--tools"));
+      } finally {
+        restoreEnvVar("HOME", previousHome);
+      }
     });
   });
 
